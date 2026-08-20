@@ -60,6 +60,38 @@ state from SQLite on start, so a restart never double-copies anything.
 If you did not install to `/home/ubuntu/copybot`, edit `User=`,
 `WorkingDirectory=`, `ExecStart=` and `ReadWritePaths=` in both unit files.
 
+### Or run it in a `screen` session instead
+
+Useful if you'd rather watch the bot work than read log files. Two things
+systemd gives you that `screen` does not: surviving a reboot, and restarting
+after a crash. `scripts/run-forever.sh` restores the second one.
+
+```bash
+sudo apt install -y screen
+cd ~/copybot
+
+screen -S copybot -dm ./scripts/run-forever.sh          # the bot
+screen -S dash -dm bash -c 'PYTHONPATH=src .venv/bin/python -m copybot.main dashboard'
+```
+
+| Task | Command |
+|---|---|
+| List sessions | `screen -ls` |
+| Watch the bot | `screen -r copybot` |
+| Leave it running | press `Ctrl-A` then `D` |
+| Stop it | `screen -S copybot -X quit` |
+| Peek without attaching | `tail -f ~/copybot/logs/copybot.log` |
+
+To survive reboots, add a crontab entry with `crontab -e`:
+
+```
+@reboot cd /home/ubuntu/copybot && /usr/bin/screen -S copybot -dm ./scripts/run-forever.sh
+```
+
+Restarts are recorded in `logs/restarts.log`. That file should stay empty — if
+it's filling up, something is crashing repeatedly and the "30 consecutive days
+without a crash or stall" go-live condition is not being met.
+
 ### Run it by hand instead
 
 ```bash
