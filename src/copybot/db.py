@@ -186,7 +186,8 @@ CREATE TABLE IF NOT EXISTS shadow_fills (
     cleared_max_fill  INTEGER,
     below_min_order_size INTEGER,
     fee_usd           REAL,
-    skip_reason       TEXT
+    skip_reason       TEXT,
+    unmeasurable_reason TEXT     -- why depth_cost_pct is NULL; never dropped
 );
 CREATE INDEX IF NOT EXISTS idx_shadow_ts ON shadow_fills(seen_ts DESC);
 CREATE INDEX IF NOT EXISTS idx_shadow_rung ON shadow_fills(rung_label);
@@ -208,6 +209,7 @@ CREATE TABLE IF NOT EXISTS marks (
     source      TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_marks_pos ON marks(position_id, ts);
+CREATE INDEX IF NOT EXISTS idx_marks_token ON marks(token_id, ts);
 
 CREATE TABLE IF NOT EXISTS equity_snapshots (
     ts                  INTEGER PRIMARY KEY,
@@ -271,6 +273,11 @@ class Database:
         ):
             if col not in have:
                 self._conn.execute(f"ALTER TABLE positions ADD COLUMN {col} {decl}")
+        shadow = {r["name"] for r in self._conn.execute("PRAGMA table_info(shadow_fills)")}
+        if "unmeasurable_reason" not in shadow:
+            self._conn.execute("ALTER TABLE shadow_fills ADD COLUMN unmeasurable_reason TEXT")
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_marks_token ON marks(token_id, ts)")
 
     # -- plumbing ----------------------------------------------------------
     @property
@@ -501,8 +508,9 @@ class Database:
                     his_price, his_ts, his_usd_size, book_timestamp_ms,
                     book_best_ask, book_ask_levels, outcome, rung_label, rung_usd,
                     filled, shares, vwap, depth_cost_pct, levels_consumed,
-                    cleared_max_fill, below_min_order_size, fee_usd, skip_reason)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    cleared_max_fill, below_min_order_size, fee_usd, skip_reason,
+                    unmeasurable_reason)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     getattr(trade, "trade_key", None),
                     getattr(trade, "token_id", None) or (book.token_id if book else ""),
@@ -519,51 +527,81 @@ class Database:
                     rung.depth_cost_pct, rung.levels_consumed,
                     1 if rung.cleared_max_fill else 0,
                     1 if rung.below_min_order_size else 0,
-                    rung.fee_usd, rung.skip_reason,
+                    rung.fee_usd, rung.skip_reason, rung.unmeasurable_reason,
                 ),
             )
 
     def shadow_ladder_summary(self) -> list[dict]:
         """Median depth cost and clear rate per rung -- the capacity curve."""
-        labels = [r["rung_label"] for r in self._all(
-            "SELECT DISTINCT rung_label FROM shadow_fills")]
+        """Capacity curve, computed on PAIRED signals only.
+
+        Only signals where every rung produced a depth cost are included, so
+        each rung's median is taken over exactly the same set of book snapshots.
+        A median that silently spans different subsets is worse than no number.
+
+        The representative size per rung is the **median**, not the mean:
+        `his_fill` and `his_position` vary per signal and their means are pulled
+        far above their medians by a few large fills. Reporting a mean size
+        beside a median cost invites a false inversion.
+        """
+        paired = [r["trade_key"] for r in self._all(
+            """SELECT trade_key FROM shadow_fills
+               WHERE trade_key IS NOT NULL
+               GROUP BY trade_key
+               HAVING SUM(depth_cost_pct IS NULL) = 0""")]
+        if not paired:
+            return []
+        marks = ",".join("?" * len(paired))
+        rows = self._all(
+            f"""SELECT rung_label, rung_usd, depth_cost_pct, filled,
+                       cleared_max_fill, levels_consumed
+                FROM shadow_fills WHERE trade_key IN ({marks})""", paired)
+
+        grouped: dict[str, list] = {}
+        for row in rows:
+            grouped.setdefault(row["rung_label"], []).append(row)
+
+        def median(values: list[float]):
+            if not values:
+                return None
+            ordered = sorted(values)
+            return ordered[len(ordered) // 2]
+
         out = []
-        for label in labels:
-            rows = self._all(
-                """SELECT depth_cost_pct, filled, cleared_max_fill, rung_usd,
-                          levels_consumed
-                   FROM shadow_fills WHERE rung_label = ?""", (label,))
-            n = len(rows)
-            if not n:
-                continue
-            # Signals where the book was empty carry no depth information at
-            # all. Averaging them in as zero would understate the real cost, so
-            # measurable rows are counted and averaged separately from all rows.
-            measurable = [r for r in rows if r["depth_cost_pct"] is not None]
-            costs = sorted(r["depth_cost_pct"] for r in measurable)
-            filled = [r for r in rows if r["filled"]]
+        for label, group in grouped.items():
+            n = len(group)
+            costs = sorted(r["depth_cost_pct"] for r in group)
+            filled = [r for r in group if r["filled"]]
             out.append({
                 "rung": label,
                 "n": n,
-                "measured": len(measurable),
-                # his_fill / his_position vary per signal, so the representative
-                # size is the average rather than whichever row came back first.
-                "usd": sum(r["rung_usd"] for r in rows) / n,
-                "median_depth_cost_pct": costs[len(costs) // 2] if costs else None,
-                "p90_depth_cost_pct": costs[min(len(costs) - 1, int(len(costs) * 0.9))]
-                                      if costs else None,
+                "paired_signals": len(paired),
+                "median_usd": median([r["rung_usd"] for r in group]),
+                "min_usd": min(r["rung_usd"] for r in group),
+                "max_usd": max(r["rung_usd"] for r in group),
+                "median_depth_cost_pct": median(costs),
+                "p90_depth_cost_pct": costs[min(n - 1, int(n * 0.9))],
                 "fill_rate": len(filled) / n,
-                "clear_rate": sum(r["cleared_max_fill"] for r in rows) / n,
-                # Levels are only meaningful where a fill actually happened.
+                "clear_rate": sum(r["cleared_max_fill"] for r in group) / n,
                 "mean_levels": (sum(r["levels_consumed"] or 0 for r in filled) / len(filled))
                                if filled else None,
             })
-        return sorted(out, key=lambda r: r["usd"])
+        return sorted(out, key=lambda r: r["median_usd"])
 
     def depth_cost_distribution(self, rung_label: str = "$3") -> list[float]:
+        """Measured depth costs for one rung, on paired signals only."""
         return [r["depth_cost_pct"] for r in self._all(
-            "SELECT depth_cost_pct FROM shadow_fills WHERE rung_label = ? "
-            "AND depth_cost_pct IS NOT NULL ORDER BY depth_cost_pct", (rung_label,))]
+            """SELECT depth_cost_pct FROM shadow_fills WHERE rung_label = ?
+               AND depth_cost_pct IS NOT NULL
+               AND trade_key IN (SELECT trade_key FROM shadow_fills
+                                 WHERE trade_key IS NOT NULL GROUP BY trade_key
+                                 HAVING SUM(depth_cost_pct IS NULL) = 0)
+               ORDER BY depth_cost_pct""", (rung_label,))]
+
+    def unmeasurable_ladder_counts(self) -> dict[str, int]:
+        return {r["unmeasurable_reason"]: r["n"] for r in self._all(
+            "SELECT unmeasurable_reason, COUNT(*) AS n FROM shadow_fills "
+            "WHERE unmeasurable_reason IS NOT NULL GROUP BY unmeasurable_reason")}
 
     # -- marks -------------------------------------------------------------
     def record_mark(self, conn, position_id: int, token_id: str, ts: int,

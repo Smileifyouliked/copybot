@@ -144,6 +144,27 @@ finish line sometimes isn't.
 Watch the capture rate underneath. **If it's low, this number can't be
 trusted** and you should say so rather than read into it.
 
+### "Where you stand against your own stopping rule"
+
+The thresholds were fixed before starting, on purpose, so they cannot be argued
+with later. The panel shows the current value beside each one so the decision is
+a reading rather than an argument. **Any single breach ends the project.**
+
+| Kill condition | Ends it when |
+|---|---|
+| Depth cost at $3 | median over 25% across 50+ paired signals (retest $1 first) |
+| Depth cost at $1 | median also over 25% — unreachable at any size worth trading |
+| Price moved our way (+60 min) | median negative after 100 copies, regardless of P&L |
+| Final-price capture failures | over 30% — the primary metric is broken, fix before collecting more |
+
+**P&L says nothing before 700 resolved copies** (~10 weeks at ~10/day). Going
+live additionally needs positive median CLV and 30 consecutive days with no
+crash or stall.
+
+The full text, and why the depth number carries the whole project, is in
+NOTES.md §10. Don't loosen these mid-experiment — if one turns out to be wrong,
+write down why rather than editing it quietly.
+
 ### The warning banner
 
 Appears when we're paying more than 15% worse than he is, on average. It is a

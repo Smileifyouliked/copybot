@@ -402,6 +402,55 @@ these books ~0%, ours moves them ~70%.** If that holds up over a real sample,
 size is the binding constraint, not selection — and his edge may partly be an
 artifact of being small enough not to move the market.
 
+### Integrity guarantees
+
+Three things protect the ladder from being quietly wrong, because if it is
+wrong every capacity conclusion drawn from it is wrong too:
+
+1. **One row per (signal, rung), always.** A rung that cannot be measured is
+   stored with a NULL depth cost and an `unmeasurable_reason`, never dropped.
+   Dropping it would let a median silently span different subsets of signals.
+2. **Aggregation is paired-only.** `capacity_curve()` includes a signal only
+   when *every* rung produced a depth cost on that snapshot, so each rung's
+   median is taken over exactly the same set of books. The dashboard shows n
+   per rung and the count of excluded signals.
+3. **Monotonicity is asserted, not hoped for.** Within a single snapshot, depth
+   cost must be non-decreasing across ascending rung sizes.
+   `assert_monotonic_depth_cost()` **raises** `LadderInversionError` on
+   violation. It is arithmetically impossible for a correct walk — levels are
+   consumed cheapest-first, so a larger order can only reach equal or worse
+   prices — so a violation means the walk is broken and must stop the trade,
+   not log a warning.
+
+### The reported inversion, diagnosed
+
+An early dashboard showed `his_fill` at "avg $1.26" costing +0.0% while `$1.00`
+cost +24%, and `his_position` at "avg $3.41" costing +10.5% while `$3.00` cost
++70%. Both inversions ran the same direction: making his sizes look free and
+ours look expensive.
+
+**It was not a walk bug.** Checked per-signal across 28 fully-measured signals:
+**zero monotonicity violations**, and all 99 signals had all five rungs (no
+partial measurement — an empty book makes every rung unmeasurable at once, so
+pairing was already intact).
+
+The fault was in the aggregate table, which printed each rung's **mean** size
+beside its **median** depth cost. His fill sizes are heavily skewed:
+
+| rung | min | median | mean | max |
+|---|---|---|---|---|
+| `his_fill` | $0.00 | **$0.20** | $1.47 | $12.25 |
+| `his_position` | $0.04 | **$2.23** | $3.43 | $13.49 |
+
+So the row labelled "$1.26" was reporting the median cost of a rung that is
+typically **20 cents**. Comparing a median cost against a mean size, in a
+column that invited exactly that inference. The curve now reports **median**
+size with the min-max range beside it.
+
+The underlying reading is unchanged and still worth taking seriously: at his
+typical fill size the book barely moves, at ours it does. But it is a
+20c-vs-$3 comparison, not $1.26-vs-$3.
+
 ---
 
 ## 9. The mark path
@@ -423,12 +472,75 @@ the outcome, not a market price — and using it would turn CLV into a restateme
 of the result.
 
 **Growth:** ~10 new positions/day × ~288 marks each (5-minute cadence over a
-~24h weather market) is roughly 3k rows/day, ~1M/year. Trivial for SQLite with
-the index on `(position_id, ts)`, and comfortable on a t3.small.
+~24h weather market) is roughly 3k rows/day, ~1M/year. Trivial for SQLite on a
+t3.small with indexes on **both** `(position_id, ts)` (horizon lookups) and
+`(token_id, ts)` (per-token history). Both are created on startup, including on
+databases made before the second index existed.
+
+### Book timestamps, measured
+
+**VERIFIED 2026-08-20:** the CLOB `timestamp` is the book's **last-update**
+time, not the time the response was produced. Repeated fetches of an unchanged
+book return an identical timestamp, and most fetches yield a *negative* lag
+against the decision moment. Across 12 live fetches: min −7984ms, median
+−4005ms, max **+769ms**. The 2s `max_book_lag_seconds` bound admits all of them
+with 1231ms of headroom, so the tightening from 5s to 2s is safe.
 
 ---
 
-## 10. Secrets
+## 10. The stopping rule
+
+Fixed while neutral, on purpose, so it cannot be renegotiated at week three
+while down money and hopeful. Recorded here verbatim as agreed. The dashboard
+renders current standing against each threshold; the numbers live in
+`config.yaml` under the `kill_*` / `pnl_verdict_*` / `go_live_*` keys.
+
+**Do not loosen these mid-experiment.** If a threshold turns out to be wrong,
+that is a finding to write down here, not an edit to make quietly.
+
+### Kill conditions — any one of these ends the project
+
+* **Depth, $3:** after 50+ signals with valid ladder rows, if median depth cost
+  at $3 exceeds 25%, $3 is not viable. Retest at $1 before killing outright.
+* **Depth, $1:** if median depth cost at $1 also exceeds 25% across 50+
+  signals, the strategy is unreachable at any size I'd trade. Kill.
+* **CLV:** after 100 copies, if median CLV at the +60min horizon is negative,
+  kill regardless of P&L.
+* **Metric integrity:** if closing-line capture failure exceeds 30%, stop and
+  fix before collecting further — a broken primary metric means I'm
+  accumulating unusable data.
+
+### Continue conditions
+
+* P&L verdict requires 700 resolved copies, not fewer. At ~10/day that's ~10
+  weeks. Anything before that is noise at these prices and I will not read it
+  as a result.
+* Go-live requires: all kill conditions clear, positive median CLV, and 30
+  consecutive days without a crash or stall.
+
+### Why the depth number carries the project
+
+If the depth cost at $3 survives proper measurement at anything like the early
+reading, it is the whole story. At a 5c ask a 70% depth cost means an 8.5c
+fill. After fees that needs roughly an **8.9% win rate** to break even where
+the market's fair rate is **5%** — his picks would have to be about **78%
+better than fair** just to cover the slippage, before any profit at all.
+Meanwhile at his own size he pays near zero.
+
+If that holds, his edge is not copyable at our size and no amount of tuning
+fixes it. That is why the ladder has an assertion rather than a warning.
+
+### How "no crash or stall" is measured
+
+`analytics.days_without_stall()` walks the heartbeat table and finds the last
+gap longer than 300 seconds. API failures do **not** count as stalls — those
+still write a heartbeat, which is exactly why the heartbeat is written on every
+pass rather than only successful ones. Only the process actually not running
+breaks the streak.
+
+---
+
+## 11. Secrets
 
 No API keys, private keys, or secrets appear in the code or in `config.yaml`, and
 none are needed for paper mode — all three endpoints used are public and
@@ -445,7 +557,7 @@ dashboard off localhost. Don't set it.
 
 ---
 
-## 11. Still open
+## 12. Still open
 
 - Whether a disputed UMA resolution can reverse a settlement we already booked.
 - Whether `feeSchedule.exponent` is ever ≠ 1 (never observed; unhandled).

@@ -56,6 +56,16 @@ class LookAheadError(Exception):
     """A book timestamped after the decision moment reached the simulator."""
 
 
+class LadderInversionError(Exception):
+    """Depth cost fell as order size rose, against a single book snapshot.
+
+    This is arithmetically impossible for a correct walk: levels are consumed
+    cheapest-first, so a larger order can only ever reach equal or worse prices.
+    If it fires, the walk is wrong, and every capacity conclusion drawn from the
+    ladder is wrong with it. It raises rather than warns for that reason.
+    """
+
+
 def book_lag_ms(book: OrderBook, decision_ts: int | None,
                 decision_ts_ms: float | None = None) -> float | None:
     """How many milliseconds after the decision the book was stamped.
@@ -384,6 +394,7 @@ class LadderRung:
     below_min_order_size: bool     # measurable, but unplaceable on the exchange
     fee_usd: float
     skip_reason: str | None
+    unmeasurable_reason: str | None = None  # why depth_cost_pct is None
 
 
 def size_ladder(
@@ -435,6 +446,16 @@ def size_ladder(
         below_min = bool(
             respect_min_order_size and r.filled and r.shares < r.min_order_size
         )
+        # A null depth cost always carries a reason. Dropping the rung instead
+        # would let a median silently span different subsets of signals.
+        if depth_cost is not None:
+            unmeasurable = None
+        elif not best_ask:
+            unmeasurable = "no_asks_on_book"
+        elif vwap_price <= 0:
+            unmeasurable = "walk_produced_no_shares"
+        else:
+            unmeasurable = "unknown"
         out.append(LadderRung(
             label=label,
             usd=usd,
@@ -449,5 +470,34 @@ def size_ladder(
             below_min_order_size=below_min,
             fee_usd=r.fee_usd,
             skip_reason=r.skip_reason.value if r.skip_reason else None,
+            unmeasurable_reason=unmeasurable,
         ))
+
+    assert_monotonic_depth_cost(out)
     return out
+
+
+# Depth costs are percentages; this tolerance is far below any real move and
+# comfortably above float64 accumulation error across a few dozen levels.
+MONOTONIC_EPS = 1e-6
+
+
+def assert_monotonic_depth_cost(rungs: list[LadderRung]) -> None:
+    """Within one book snapshot, depth cost must not fall as size rises.
+
+    Raises `LadderInversionError` on violation. Rungs whose cost could not be
+    measured are excluded from the comparison but never silently reorder it,
+    since an unmeasurable rung is unmeasurable for every size on that book.
+    """
+    measured = sorted(
+        (r for r in rungs if r.depth_cost_pct is not None),
+        key=lambda r: r.usd,
+    )
+    for lower, higher in zip(measured, measured[1:]):
+        if higher.depth_cost_pct < lower.depth_cost_pct - MONOTONIC_EPS:
+            raise LadderInversionError(
+                f"depth cost fell as size rose on one book snapshot: "
+                f"{lower.label} (${lower.usd:.2f}) = {lower.depth_cost_pct:+.4f}% "
+                f"but {higher.label} (${higher.usd:.2f}) = "
+                f"{higher.depth_cost_pct:+.4f}%. The walk is wrong."
+            )

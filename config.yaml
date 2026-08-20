@@ -58,7 +58,8 @@ respect_min_order_size: true   # honour the book's min_order_size on both sides
 # use a book fetched milliseconds after we decide -- that is the honest model, not
 # look-ahead. This bounds it so a book from minutes later can never be used.
 # Replay/backtest should pass 0, which requires the book to be provably earlier.
-max_book_lag_seconds: 5
+# Measured book fetches round-trip in ~100-300ms, so 2s is generous headroom.
+max_book_lag_seconds: 2
 
 # --- Shadow size ladder -----------------------------------------------------
 # On every signal, the same fill is simulated at several sizes against the SAME
@@ -73,3 +74,15 @@ shadow_ladder_include_his_sizes: true
 # horizons are always capturable because the book is still live, so a failed
 # closing-line capture no longer costs the whole measurement.
 clv_horizons_minutes: [15, 60, 360]
+
+# --- Stopping rule ----------------------------------------------------------
+# Fixed while neutral, on purpose, so it cannot be renegotiated at week three
+# while down money and hopeful. The full text is in NOTES.md; these are the
+# numbers the dashboard checks against. Do not loosen them mid-experiment.
+kill_depth_cost_pct: 25.0        # median depth cost above this kills that size
+kill_depth_min_signals: 50       # ...but only once this many paired signals exist
+kill_clv_min_copies: 100         # CLV verdict needs this many copies
+kill_clv_horizon_minutes: 60     # judged at the +60min horizon
+kill_capture_failure_pct: 30.0   # above this the primary metric is broken
+pnl_verdict_min_resolved: 700    # P&L says nothing before this many resolved copies
+go_live_min_stable_days: 30      # consecutive days with no crash or stall

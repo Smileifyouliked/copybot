@@ -63,6 +63,13 @@ class Config:
     shadow_ladder_usd: list
     shadow_ladder_include_his_sizes: bool
     clv_horizons_minutes: list
+    kill_depth_cost_pct: float
+    kill_depth_min_signals: int
+    kill_clv_min_copies: int
+    kill_clv_horizon_minutes: int
+    kill_capture_failure_pct: float
+    pnl_verdict_min_resolved: int
+    go_live_min_stable_days: int
     slippage_warn_pct: float
     respect_min_order_size: bool
     raw: dict[str, Any] = field(default_factory=dict, repr=False)
@@ -115,6 +122,13 @@ _DEFAULTS: dict[str, Any] = {
     "shadow_ladder_usd": [1.00, 3.00, 10.00],
     "shadow_ladder_include_his_sizes": True,
     "clv_horizons_minutes": [15, 60, 360],
+    "kill_depth_cost_pct": 25.0,
+    "kill_depth_min_signals": 50,
+    "kill_clv_min_copies": 100,
+    "kill_clv_horizon_minutes": 60,
+    "kill_capture_failure_pct": 30.0,
+    "pnl_verdict_min_resolved": 700,
+    "go_live_min_stable_days": 30,
 }
 
 
@@ -212,6 +226,18 @@ def _validate(cfg: Config) -> None:
         raise ConfigError("clv_horizons_minutes must all be positive")
     if cfg.max_book_lag_seconds < 0:
         raise ConfigError("max_book_lag_seconds must be >= 0")
+
+    for name in ("kill_depth_cost_pct", "kill_depth_min_signals", "kill_clv_min_copies",
+                 "kill_capture_failure_pct", "pnl_verdict_min_resolved",
+                 "go_live_min_stable_days", "kill_clv_horizon_minutes"):
+        if getattr(cfg, name) <= 0:
+            raise ConfigError(f"{name} must be > 0")
+    if cfg.kill_clv_horizon_minutes not in cfg.clv_horizons_minutes:
+        raise ConfigError(
+            f"kill_clv_horizon_minutes ({cfg.kill_clv_horizon_minutes}) must be one of "
+            f"clv_horizons_minutes ({cfg.clv_horizons_minutes}), or the stopping rule "
+            "has no data to check against"
+        )
 
     if not (0 < cfg.dashboard_port < 65536):
         raise ConfigError(f"dashboard_port out of range: {cfg.dashboard_port}")

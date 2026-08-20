@@ -259,3 +259,131 @@ def capacity_curve(db: Database) -> list[dict]:
       * nothing clears at any size     -> stop now, not in month three
     """
     return db.shadow_ladder_summary()
+
+
+def days_without_stall(db: Database) -> float | None:
+    """Consecutive days of heartbeats with no gap longer than the stall window.
+
+    A gap means the process was not running: a crash, an OOM kill, a stall. API
+    failures do not count -- those still write a heartbeat, which is the whole
+    reason the heartbeat is written on every pass rather than only successful
+    ones.
+    """
+    rows = db.conn.execute("SELECT ts FROM heartbeat ORDER BY ts ASC").fetchall()
+    if len(rows) < 2:
+        return None
+    stall_seconds = 300
+    last_break = rows[0]["ts"]
+    for previous, current in zip(rows, rows[1:]):
+        if current["ts"] - previous["ts"] > stall_seconds:
+            last_break = current["ts"]
+    return (rows[-1]["ts"] - last_break) / 86400.0
+
+
+def stopping_rules(db: Database, cfg) -> dict:
+    """Current standing against the kill and continue conditions.
+
+    The thresholds were fixed while neutral. This renders where things stand
+    against them so the decision is a reading, not an argument.
+    """
+    curve = {r["rung"]: r for r in capacity_curve(db)}
+    stake_label = f"${cfg.stake_per_copy_usd:g}"
+    paired = curve[stake_label]["paired_signals"] if stake_label in curve else 0
+
+    def depth_rule(label: str, name: str) -> dict:
+        row = curve.get(label)
+        value = row["median_depth_cost_pct"] if row else None
+        enough = paired >= cfg.kill_depth_min_signals
+        if not enough or value is None:
+            status = "waiting"
+        elif value > cfg.kill_depth_cost_pct:
+            status = "breach"
+        else:
+            status = "ok"
+        return {
+            "name": name,
+            "value": f"{value:+.1f}%" if value is not None else "—",
+            "threshold": f"over {cfg.kill_depth_cost_pct:.0f}%",
+            "status": status,
+            "progress": f"{paired} / {cfg.kill_depth_min_signals} paired signals",
+        }
+
+    horizon = next(
+        (r for r in clv_at_horizons(db, [cfg.kill_clv_horizon_minutes])
+         if r["horizon_minutes"] == cfg.kill_clv_horizon_minutes),
+        None,
+    )
+    copies = db.conn.execute(
+        "SELECT COUNT(*) AS n FROM copied_trades WHERE side='BUY'"
+    ).fetchone()["n"]
+    clv_value = horizon["median_clv_pct"] if horizon else None
+    if copies < cfg.kill_clv_min_copies or clv_value is None:
+        clv_status = "waiting"
+    elif clv_value < 0:
+        clv_status = "breach"
+    else:
+        clv_status = "ok"
+
+    capture = clv_summary(db, cfg.clv_max_spread)
+    failure_pct = (
+        (1 - capture["capture_rate"]) * 100 if capture["capture_rate"] is not None else None
+    )
+    if failure_pct is None:
+        capture_status = "waiting"
+    elif failure_pct > cfg.kill_capture_failure_pct:
+        capture_status = "breach"
+    else:
+        capture_status = "ok"
+
+    resolved = db.conn.execute(
+        "SELECT COUNT(*) AS n FROM positions WHERE status='closed' AND exit_path='resolution'"
+    ).fetchone()["n"]
+    stable = days_without_stall(db)
+
+    kill = [
+        depth_rule(stake_label, f"Depth cost at {stake_label}"),
+        depth_rule("$1", "Depth cost at $1"),
+        {
+            "name": f"Price moved our way (+{cfg.kill_clv_horizon_minutes} min)",
+            "value": f"{clv_value:+.1f}%" if clv_value is not None else "—",
+            "threshold": "negative",
+            "status": clv_status,
+            "progress": f"{copies} / {cfg.kill_clv_min_copies} copies",
+        },
+        {
+            "name": "Final-price capture failures",
+            "value": f"{failure_pct:.0f}%" if failure_pct is not None else "—",
+            "threshold": f"over {cfg.kill_capture_failure_pct:.0f}%",
+            "status": capture_status,
+            "progress": f"{capture['closed']} finished bets",
+        },
+    ]
+    breaches = [r for r in kill if r["status"] == "breach"]
+    # "No breaches" is not the same as "cleared". Every condition must have
+    # enough data to have actually passed, or the go-live gate shows a green
+    # tick for conditions nothing has been measured against yet.
+    all_cleared = all(r["status"] == "ok" for r in kill)
+
+    return {
+        "kill": kill,
+        "breaches": len(breaches),
+        "breach_names": [r["name"] for r in breaches],
+        "pnl_verdict": {
+            "resolved": resolved,
+            "required": cfg.pnl_verdict_min_resolved,
+            "ready": resolved >= cfg.pnl_verdict_min_resolved,
+            "progress_pct": min(100.0, 100.0 * resolved / cfg.pnl_verdict_min_resolved),
+        },
+        "go_live": {
+            "stable_days": stable,
+            "required_days": cfg.go_live_min_stable_days,
+            "kills_clear": all_cleared,
+            "still_collecting": sum(1 for r in kill if r["status"] == "waiting"),
+            "clv_positive": clv_value is not None and clv_value > 0,
+            "ready": (
+                all_cleared
+                and clv_value is not None and clv_value > 0
+                and stable is not None and stable >= cfg.go_live_min_stable_days
+            ),
+        },
+    }

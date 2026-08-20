@@ -150,29 +150,101 @@
     <h3>What would happen at other bet sizes</h3>
     <p class="muted small" style="margin:-4px 0 10px">
       Measured on the same prices at the same moment, without actually betting.
-      Tells you whether $3 is the right size. "Could measure" excludes signals
-      where nobody was selling at all, since those carry no price information.
+      Tells you whether $3 is the right size. Every row below is computed on the
+      <strong>same set of signals</strong> — a size is only included when every
+      other size could be measured on that same snapshot too.
     </p>
     {% if not ladder %}
       <p class="empty">No signals measured yet.</p>
     {% else %}
     <div class="scroll"><table>
-      <tr><th>Bet size</th><th class="num">Signals</th><th class="num">Could measure</th>
+      <tr><th>Bet size</th><th class="num">Typical size</th><th class="num">Signals</th>
           <th class="num">Typical extra cost</th><th class="num">Price levels used</th>
           <th class="num">Would have gone through</th></tr>
       {% for r in ladder %}
       <tr>
         <td><strong>{{ r.rung }}</strong>
-            {% if r.rung.startswith('his') %}<span class="muted small">(avg {{ money(r.usd) }} — the wallet's own size)</span>{% endif %}</td>
+            {% if r.rung.startswith('his') %}<span class="muted small">the wallet's own size</span>{% endif %}</td>
+        <td class="num">{{ money(r.median_usd) }}
+            {% if r.rung.startswith('his') %}<div class="muted small">{{ money(r.min_usd) }}–{{ money(r.max_usd) }}</div>{% endif %}</td>
         <td class="num">{{ r.n }}</td>
-        <td class="num">{{ r.measured }}</td>
         <td class="num">{{ ("%+.1f%%"|format(r.median_depth_cost_pct)) if r.median_depth_cost_pct is not none else "—" }}</td>
         <td class="num">{{ "%.1f"|format(r.mean_levels) if r.mean_levels is not none else "—" }}</td>
         <td class="num">{{ "%.0f"|format(100 * r.clear_rate) if r.clear_rate is not none else "—" }}%</td>
       </tr>
       {% endfor %}
     </table></div>
+    <p class="muted small" style="margin:10px 0 0">
+      Based on {{ ladder[0].paired_signals }} signal{{ '' if ladder[0].paired_signals == 1 else 's' }}
+      where every size could be measured.
+      {% if unmeasurable %}
+        Excluded: {% for reason, n in unmeasurable.items() %}{{ n }} {{ reason.replace('_', ' ') }}{{ ", " if not loop.last }}{% endfor %}.
+      {% endif %}
+      Bigger bets can only ever cost more than smaller ones on the same prices —
+      the bot raises an error if that is ever violated.
+    </p>
     {% endif %}
+  </div>
+
+  <!-- ============ stopping rule ============ -->
+  <div class="card">
+    <h2>Where you stand against your own stopping rule</h2>
+    <p class="muted small" style="margin:-8px 0 14px">
+      You set these thresholds before starting, on purpose, so they can't be
+      argued with later. Any single breach ends the project.
+    </p>
+
+    {% if rules.breaches %}
+    <div class="banner" style="margin-bottom:14px">
+      🛑 <strong>{{ rules.breaches }} kill condition breached</strong> —
+      {{ rules.breach_names|join('; ') }}. This is the point where you stop.
+    </div>
+    {% endif %}
+
+    <div class="scroll"><table>
+      <tr><th>Kill condition</th><th class="num">Now</th><th class="num">Kills if</th>
+          <th class="num">Data so far</th><th class="num">Status</th></tr>
+      {% for r in rules.kill %}
+      <tr>
+        <td>{{ r.name }}</td>
+        <td class="num">{{ r.value }}</td>
+        <td class="num muted">{{ r.threshold }}</td>
+        <td class="num muted small">{{ r.progress }}</td>
+        <td class="num">
+          {% if r.status == 'breach' %}<span class="down">🛑 breached</span>
+          {% elif r.status == 'ok' %}<span class="up">✓ clear</span>
+          {% else %}<span class="muted">collecting</span>{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </table></div>
+
+    <h3>Before P&amp;L means anything</h3>
+    <table>
+      <tr>
+        <td style="width:200px">{{ rules.pnl_verdict.resolved }} of {{ rules.pnl_verdict.required }} finished bets</td>
+        <td><div class="bar"><span style="width:{{ rules.pnl_verdict.progress_pct|round(1) }}%"></span></div></td>
+        <td class="num" style="width:90px">{{ rules.pnl_verdict.progress_pct|round(0)|int }}%</td>
+      </tr>
+    </table>
+    <p class="muted small" style="margin:6px 0 0">
+      At roughly 10 a day that's about 10 weeks. Any profit or loss before then
+      is noise at these prices — don't read it as a result.
+    </p>
+
+    <h3>Before going live</h3>
+    <table>
+      <tr><td>All kill conditions clear</td>
+          <td class="num">
+            {% if rules.go_live.kills_clear %}<span class="up">✓</span>
+            {% elif rules.breaches %}<span class="down">✗ breached</span>
+            {% else %}<span class="muted">{{ rules.go_live.still_collecting }} still collecting</span>{% endif %}
+          </td></tr>
+      <tr><td>Price moves our way on average</td>
+          <td class="num">{% if rules.go_live.clv_positive %}<span class="up">✓</span>{% else %}<span class="muted">not yet</span>{% endif %}</td></tr>
+      <tr><td>{{ rules.go_live.required_days }} days with no crash or stall</td>
+          <td class="num">{% if rules.go_live.stable_days is not none %}{{ "%.1f"|format(rules.go_live.stable_days) }} days{% else %}—{% endif %}</td></tr>
+    </table>
   </div>
 
   <!-- ============ CLV ============ -->

@@ -21,7 +21,7 @@ from starlette.requests import Request
 from .analytics import (band_breakdown, capacity_curve, clv_at_horizons,
                         clv_summary, depth_cost_summary, exit_path_breakdown,
                         expected_vs_actual_winners, fee_summary,
-                        slippage_summary)
+                        slippage_summary, stopping_rules)
 from .config import Config
 from .db import Database, now_ts
 
@@ -227,6 +227,8 @@ def build_state(cfg: Config, db: Database) -> dict:
         "clv_horizons": clv_at_horizons(db, cfg.clv_horizons_minutes),
         "depth": depth,
         "ladder": capacity_curve(db),
+        "rules": stopping_rules(db, cfg),
+        "unmeasurable": db.unmeasurable_ladder_counts(),
         "slippage": slippage,
         "bands": band_breakdown(db),
         "exit_paths": exit_path_breakdown(db),
