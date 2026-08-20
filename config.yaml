@@ -37,6 +37,15 @@ log_backup_count: 5
 resolution_check_interval_seconds: 300
 equity_snapshot_interval_seconds: 300
 
+# --- Closing line capture ---------------------------------------------------
+# CLV is the primary metric and it depends on catching a price from a book that
+# goes empty the moment the market resolves. Near a market's endDate the marking
+# loop tightens so a resolution between two marks doesn't lose the closing line.
+mark_interval_seconds: 300
+near_close_window_seconds: 1800   # within this of endDate -> mark faster
+mark_interval_near_close_seconds: 60
+clv_max_spread: 0.05              # wider spread -> CLV flagged low-quality
+
 # Entry is "worse than his" by this % -> dashboard warning banner.
 # Paper mode warns only. Live mode should HALT here (see NOTES.md).
 slippage_warn_pct: 15.0

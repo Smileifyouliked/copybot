@@ -54,6 +54,10 @@ class Config:
     log_backup_count: int
     resolution_check_interval_seconds: int
     equity_snapshot_interval_seconds: int
+    mark_interval_seconds: int
+    near_close_window_seconds: int
+    mark_interval_near_close_seconds: int
+    clv_max_spread: float
     slippage_warn_pct: float
     respect_min_order_size: bool
     raw: dict[str, Any] = field(default_factory=dict, repr=False)
@@ -97,6 +101,10 @@ _DEFAULTS: dict[str, Any] = {
     "equity_snapshot_interval_seconds": 300,
     "slippage_warn_pct": 15.0,
     "respect_min_order_size": True,
+    "mark_interval_seconds": 300,
+    "near_close_window_seconds": 1800,
+    "mark_interval_near_close_seconds": 60,
+    "clv_max_spread": 0.05,
 }
 
 
@@ -180,6 +188,9 @@ def _validate(cfg: Config) -> None:
         "poll_interval_seconds",
         "resolution_check_interval_seconds",
         "equity_snapshot_interval_seconds",
+        "mark_interval_seconds",
+        "near_close_window_seconds",
+        "mark_interval_near_close_seconds",
     ):
         if getattr(cfg, name) <= 0:
             raise ConfigError(f"{name} must be > 0")

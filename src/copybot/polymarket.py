@@ -20,6 +20,7 @@ from typing import Any, Iterable, Sequence
 
 import httpx
 
+from .batch import reconcile_batch
 from .models import MarketMeta, OrderBook, parse_json_list
 
 log = logging.getLogger(__name__)
@@ -158,12 +159,25 @@ class PolymarketClient:
                     except PolymarketError as inner:
                         log.warning("book fetch failed for %s: %s", t[:16], inner)
                 continue
-            for entry in data if isinstance(data, list) else []:
-                if not isinstance(entry, dict):
-                    continue
-                book = OrderBook.from_clob(entry)
-                if book.token_id:
-                    out[book.token_id] = book
+            books = [
+                OrderBook.from_clob(e) for e in (data if isinstance(data, list) else [])
+                if isinstance(e, dict)
+            ]
+            # POST /books omits tokens with no book (resolved markets) rather
+            # than returning an empty one, so the response is shorter than the
+            # request and index-alignment would mismark positions.
+            by_id, missing, _ = reconcile_batch(
+                chunk, books, key_of=lambda b: b.token_id or None, what="CLOB POST /books"
+            )
+            out.update(by_id)
+            for token_id in missing:
+                # Absent means "no book", which is a real state, not an error.
+                # Recorded as an explicitly empty book so callers cannot
+                # mistake it for a book they simply failed to look up.
+                out[token_id] = OrderBook(
+                    token_id=token_id, bids=[], asks=[],
+                    tick_size=0.001, min_order_size=5.0, timestamp_ms=0,
+                )
         return out
 
     # -- markets -----------------------------------------------------------
@@ -191,16 +205,20 @@ class PolymarketClient:
             except PolymarketError as exc:
                 log.warning("gamma /markets failed for %d ids: %s", len(chunk), exc)
                 continue
-            for row in data if isinstance(data, list) else []:
-                meta = self._parse_market(row)
-                if meta is None:
-                    continue
+            metas = [
+                m for m in (self._parse_market(r) for r in
+                            (data if isinstance(data, list) else []))
+                if m is not None
+            ]
+            # gamma silently drops unknown condition_ids: ask for 2, get 1, 200 OK.
+            by_id, _missing, _unexpected = reconcile_batch(
+                chunk, metas, key_of=lambda m: m.condition_id or None,
+                what="gamma /markets",
+            )
+            for cid, meta in by_id.items():
                 ttl = self.resolved_market_ttl if meta.closed else self.market_ttl
-                self._market_cache[meta.condition_id] = _Cached(meta, time.monotonic() + ttl)
-                out[meta.condition_id] = meta
-            got = {c for c in chunk if c in out}
-            for c in set(chunk) - got:
-                log.warning("gamma returned no market for conditionId %s", c)
+                self._market_cache[cid] = _Cached(meta, time.monotonic() + ttl)
+                out[cid] = meta
         return out
 
     @staticmethod

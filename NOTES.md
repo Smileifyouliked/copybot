@@ -238,9 +238,112 @@ The client handles 429 and 5xx with exponential backoff plus jitter and honours
    different mode, different purpose. Not yet implemented, since live is not
    implemented.
 
+8. **The $3 stake is the TOTAL cash outlay, fee included.** "Every copy spends
+   a fixed $3.00. Not more, not less." So the book walk charges each level at
+   `price + fee_per_share(price)` and stops when $3 of cash is committed, rather
+   than buying $3 of shares and paying the fee on top (which would spend ~$3.15).
+   At a 5c entry this is the difference between 60.0 and 57.1 shares.
+
+9. **The entry fee is capitalised into cost basis**, not booked as an immediate
+   realised loss. It has to land in exactly one place or the reconciliation
+   identity breaks by exactly the fee -- `test_double_counting_the_entry_fee_
+   breaks_the_identity` and `test_omitting_the_fee_from_basis_also_breaks_the_
+   identity` pin both failure directions.
+
+10. **Batch responses are never zipped by index.** `batch.reconcile_batch()`
+    keys every batch response by its own identifier, logs each omission at WARN,
+    and flags any id we never requested. This is a codebase-wide rule, not a
+    local fix: Polymarket has now been observed silently dropping items from a
+    batch twice (gamma on unknown condition_ids, POST /books on resolved
+    tokens), both with HTTP 200. Index-alignment would attribute one token's
+    book to another token and mark a position at the wrong price -- silently,
+    with a plausible-looking number.
+
+11. **Only a book-derived mark can become the closing line.** gamma's price for
+    a resolved market is 0 or 1, which is the outcome, not a line; using it
+    would make CLV a restatement of the result. When the book is empty the mark
+    falls back to gamma so equity stays correct, but `closing_line_*` is left
+    alone.
+
+12. **His position stats keep updating after the copy.** Our entry is frozen at
+    one fill; his keeps improving as he scales in (median ~5 fills per token).
+    `his_position_usd_at_copy` is frozen for the record, while
+    `his_vwap_entry`, `his_position_usd_total` and `size_ratio_vs_total` are
+    refreshed on every later fill of his in a token we hold. Without this the
+    averaging-down gap would be invisible by construction.
+
+13. **Two size ratios, because they answer different questions.**
+    `size_ratio` = our $3 / the fill we copied. `size_ratio_vs_total` = our $3 /
+    his entire position in that token. The first says how much bigger our order
+    was than his; the second says how much bigger our bet is than his
+    conviction. Observed example: he opened a token with $0.50 and scaled to
+    $0.88 across 9 fills, so the two ratios are 6.0x and 3.4x.
+
 ---
 
-## 6. Secrets
+## 6. Metrics
+
+### CLV is the primary metric
+At a 5c average entry the break-even win rate is ~5.2%. Sixty resolved copies
+give ~3 expected winners; a real edge gives ~4. Distinguishing those on P&L
+needs roughly 700 resolved copies -- two months or more. CLV is continuous per
+trade rather than 0/1, so it says something long before then.
+
+Because CLV depends on capturing a price from a book that empties the instant a
+market resolves, the capture is instrumented rather than assumed:
+
+* the marking interval tightens from 300s to 60s within 30 minutes of `endDate`,
+  so a market resolving between two marks does not lose its closing line;
+* `closing_line_bid`, `closing_line_ask` and `closing_line_spread` are stored
+  alongside the price, because a mid taken across a wide spread is a fiction --
+  `clv_max_spread` (0.05) splits clean captures from wide ones;
+* `closing_line_age_seconds` records how stale the capture was at resolution;
+* the capture **failure rate** is a first-class dashboard number. If it is high,
+  the primary metric is broken and that needs to be visible immediately.
+
+### Expected vs actual winners
+Under the null that each market was fairly priced at our entry:
+
+    expected winners = Σ pᵢ        variance = Σ pᵢ(1 − pᵢ)
+
+over resolved copies, where `pᵢ` is our entry price. Independent Bernoulli
+trials with differing p, so variances add. At 60 copies averaging 5c that is
+**3 ± 1.7 (1 s.d.)**, which is exactly why a red P&L number in week two means
+nothing. This sits under the headline number so "unlucky" and "broken" are
+visually distinguishable.
+
+**ASSUMPTION** our entry price is a fair estimate of the true probability under
+the null. That is the null hypothesis itself, not a claim about reality -- if
+the wallet has edge, actual should exceed expected, which is the test.
+
+---
+
+## 7. Measured: what a \$3 order does to these books
+
+Probed on 2026-08-20 against every token this wallet traded in 8 days. 83 of 86
+had already resolved and returned empty books, leaving 3 live -- too few to be a
+statistic, but enough to confirm the mechanism:
+
+| best ask | our $3 VWAP | depth cost | levels eaten |
+|---|---|---|---|
+| 0.0300 | 0.0534 | **+78.0%** | 4 |
+| 0.0700 | 0.0736 | +5.1% | 2 |
+| 0.0600 | 0.0600 | −0.0% | 1 |
+
+This is pure depth cost measured on a single snapshot -- zero latency, zero
+drift. One book in three moved 78% against a $3 order. Any model that filled at
+the mid or at the best ask would have been wrong by that much on that trade.
+
+**Not measured, and not measurable retrospectively:** the real latency slippage
+(his fill vs our fill ~15s later). It needs the book as it stood seconds after
+his trade, and no historical book endpoint is available. Comparing his old fills
+against today's books measures hours of drift, not our latency, and was
+discarded rather than reported. The bot collects this going forward; it is what
+`slippage_vs_his_entry_pct` is for.
+
+---
+
+## 8. Secrets
 
 No API keys, private keys, or secrets appear in the code or in `config.yaml`, and
 none are needed for paper mode — all three endpoints used are public and
@@ -257,7 +360,7 @@ dashboard off localhost. Don't set it.
 
 ---
 
-## 7. Still open
+## 9. Still open
 
 - Whether a disputed UMA resolution can reverse a settlement we already booked.
 - Whether `feeSchedule.exponent` is ever ≠ 1 (never observed; unhandled).

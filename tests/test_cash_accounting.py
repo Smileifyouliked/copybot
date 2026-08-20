@@ -99,3 +99,64 @@ def test_reconcile_detects_a_tampered_ledger(db):
     ok, parts = db.reconcile()
     assert not ok
     assert parts["diff"] == pytest.approx(1.0)
+
+
+# --- Where the fee lands -----------------------------------------------------
+# Decision on record: the entry fee is capitalised into cost basis. It is NOT
+# also booked as an immediate realised loss. Accounting for it in both places,
+# or in neither, breaks the reconciliation identity by exactly the fee.
+
+def test_entry_fee_is_capitalised_into_cost_basis(db):
+    fee = 0.1425
+    with db.tx() as conn:
+        _buy(db, conn, "TOK1", shares=60.0, avg=0.05, fee=fee)
+    pos = db.open_positions()[0]
+    assert pos["cost_basis_usd"] == pytest.approx(60.0 * 0.05 + fee)
+    assert pos["entry_fee_usd"] == pytest.approx(fee)
+    assert db.realised_pnl() == pytest.approx(0.0), "entry fee must not also be realised"
+    ok, parts = db.reconcile()
+    assert ok, parts
+
+
+def test_identity_holds_with_non_zero_fees_on_both_legs(db):
+    entry_fee, exit_fee = 0.1425, 0.1197
+    with db.tx() as conn:
+        pos_id = _buy(db, conn, "TOK1", shares=60.0, avg=0.05, fee=entry_fee)
+    basis = 60.0 * 0.05 + entry_fee
+    with db.tx() as conn:
+        proceeds = 60.0 * 0.09
+        net = proceeds - exit_fee
+        realised = net - basis
+        db.insert_execution(conn, position_id=pos_id, token_id="TOK1", side="SELL", ts=2,
+                            shares=60.0, avg_fill=0.09, gross_usd=proceeds,
+                            fee_usd=exit_fee, net_usd=net, realised_pnl_usd=realised)
+        db.update_position(conn, pos_id, status="closed", closed_ts=2, shares=0.0,
+                           cost_basis_usd=0.0, realised_pnl_usd=realised,
+                           proceeds_usd=net, exit_fee_usd=exit_fee,
+                           exit_path="mirrored_sell")
+    ok, parts = db.reconcile()
+    assert ok, parts
+    # Both fees are really in the P&L: gross move was +$2.40, fees ate $0.2622.
+    assert db.realised_pnl() == pytest.approx(2.40 - entry_fee - exit_fee)
+
+
+def test_double_counting_the_entry_fee_breaks_the_identity(db):
+    """Proves the identity is sensitive to exactly this mistake."""
+    fee = 0.1425
+    with db.tx() as conn:
+        _buy(db, conn, "TOK1", shares=60.0, avg=0.05, fee=fee)
+    # Also book the entry fee as a realised loss -- the error we are excluding.
+    db.conn.execute("UPDATE positions SET realised_pnl_usd = ?", (-fee,))
+    ok, parts = db.reconcile()
+    assert not ok
+    assert parts["diff"] == pytest.approx(fee)
+
+
+def test_omitting_the_fee_from_basis_also_breaks_the_identity(db):
+    fee = 0.1425
+    with db.tx() as conn:
+        _buy(db, conn, "TOK1", shares=60.0, avg=0.05, fee=fee)
+    db.conn.execute("UPDATE positions SET cost_basis_usd = cost_basis_usd - ?", (fee,))
+    ok, parts = db.reconcile()
+    assert not ok
+    assert parts["diff"] == pytest.approx(-fee)

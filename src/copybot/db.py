@@ -71,16 +71,30 @@ CREATE TABLE IF NOT EXISTS positions (
     his_total_shares     REAL DEFAULT 0,
     his_total_usd        REAL DEFAULT 0,
     -- comparison fields
-    size_ratio           REAL,
+    size_ratio                 REAL,   -- our usd / his FIRST fill usd
+    his_position_usd_at_copy   REAL,   -- his total position when we copied
+    his_position_usd_total     REAL,   -- his total position now (he scales in)
+    size_ratio_vs_total        REAL,   -- our usd / his FULL position
     slippage_vs_his_entry      REAL,
     slippage_vs_his_entry_pct  REAL,
     slippage_vs_his_vwap       REAL,
     slippage_vs_his_vwap_pct   REAL,
-    -- marking and CLV
+    -- marking and CLV. CLV is the primary metric, so the capture is
+    -- instrumented: a wide spread makes a mid-based CLV meaningless, and a
+    -- stale capture makes it a different number than it claims to be.
     last_mark_price      REAL,
+    last_mark_bid        REAL,
+    last_mark_ask        REAL,
+    last_mark_spread     REAL,
     last_mark_ts         INTEGER,
     last_mark_source     TEXT,
     closing_line_price   REAL,
+    closing_line_bid     REAL,
+    closing_line_ask     REAL,
+    closing_line_spread  REAL,
+    closing_line_ts      INTEGER,
+    closing_line_age_seconds INTEGER,
+    closing_line_captured    INTEGER NOT NULL DEFAULT 0,
     clv_abs              REAL,
     clv_pct              REAL,
     -- exit
@@ -181,10 +195,32 @@ class Database:
         self._conn = sqlite3.connect(str(self.path), timeout=30.0, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
+        self._migrate()
         self._conn.execute(
             "INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', ?)",
             (str(SCHEMA_VERSION),),
         )
+
+    def _migrate(self) -> None:
+        """Additive column migrations. SQLite ALTER TABLE ADD COLUMN is cheap
+        and a missing column on an existing database must not be a crash."""
+        have = {r["name"] for r in self._conn.execute("PRAGMA table_info(positions)")}
+        for col, decl in (
+            ("his_position_usd_at_copy", "REAL"),
+            ("his_position_usd_total", "REAL"),
+            ("size_ratio_vs_total", "REAL"),
+            ("last_mark_bid", "REAL"),
+            ("last_mark_ask", "REAL"),
+            ("last_mark_spread", "REAL"),
+            ("closing_line_bid", "REAL"),
+            ("closing_line_ask", "REAL"),
+            ("closing_line_spread", "REAL"),
+            ("closing_line_ts", "INTEGER"),
+            ("closing_line_age_seconds", "INTEGER"),
+            ("closing_line_captured", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if col not in have:
+                self._conn.execute(f"ALTER TABLE positions ADD COLUMN {col} {decl}")
 
     # -- plumbing ----------------------------------------------------------
     @property

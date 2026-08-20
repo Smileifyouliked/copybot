@@ -172,6 +172,7 @@ class OrderBook:
     tick_size: float
     min_order_size: float
     timestamp_ms: int = 0
+    condition_id: str = ""  # the CLOB returns it as `market`
 
     @property
     def is_empty(self) -> bool:
@@ -190,6 +191,14 @@ class OrderBook:
         if self.best_bid is None or self.best_ask is None:
             return None
         return (self.best_bid + self.best_ask) / 2.0
+
+    @property
+    def spread(self) -> float | None:
+        """Absolute spread. A mid taken across a wide spread is a fiction, so
+        CLV captures record this alongside the price."""
+        if self.best_bid is None or self.best_ask is None:
+            return None
+        return self.best_ask - self.best_bid
 
     @classmethod
     def from_clob(
@@ -227,6 +236,7 @@ class OrderBook:
 
         return cls(
             token_id=str(payload.get("asset_id") or token_id or ""),
+            condition_id=str(payload.get("market") or ""),
             bids=bids,
             asks=asks,
             tick_size=num("tick_size", default_tick),
@@ -237,7 +247,12 @@ class OrderBook:
 
 @dataclass(frozen=True)
 class FillResult:
-    """Outcome of walking a book. `filled` False means we skipped."""
+    """Outcome of walking a book. `filled` False means we skipped.
+
+    A skip carries the numbers that explain it -- what the book could actually
+    have absorbed, and what our price would have been -- because a skip is
+    data, not a failure, and "skipped" with no numbers teaches nothing.
+    """
 
     filled: bool
     shares: float = 0.0
@@ -250,6 +265,18 @@ class FillResult:
     fee_rate_was_fallback: bool = False
     skip_reason: SkipReason | None = None
     detail: str = ""
+    # -- diagnostics, populated on fills and skips alike -------------------
+    requested_usd: float = 0.0
+    requested_shares: float = 0.0
+    depth_available_usd: float = 0.0     # what the book could absorb, total
+    depth_available_shares: float = 0.0
+    best_price: float = 0.0              # top of book at decision time
+    worst_price: float = 0.0             # deepest level we would have touched
+    would_be_avg_price: float = 0.0      # VWAP we'd have got, even when skipping
+    is_partial: bool = False
+    book_timestamp_ms: int = 0
+    tick_size: float = 0.0
+    min_order_size: float = 0.0
 
 
 @dataclass(frozen=True)
