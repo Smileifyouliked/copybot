@@ -341,9 +341,94 @@ against today's books measures hours of drift, not our latency, and was
 discarded rather than reported. The bot collects this going forward; it is what
 `slippage_vs_his_entry_pct` is for.
 
+14. **A 404 from CLOB `/book` is a state, not an error.** **VERIFIED
+    2026-08-20:** `GET /book?token_id=…` returns **HTTP 404** for a token with
+    no book (resolved market), rather than an empty book. This is the
+    single-fetch counterpart of `POST /books` omitting the same token. It is
+    now mapped to an empty `OrderBook` carrying its own token id, which every
+    caller already handles, and **404 and other 4xx are never retried** — the
+    original client burned all five backoff attempts (~15s) per resolved token,
+    which made a single pass over 100 trades take ~30 minutes instead of ~5
+    seconds. Only 429, 5xx and transport errors retry.
+
+15. **The look-ahead guard bounds lag; it does not require the book to precede
+    the decision.** A live fill legitimately uses a book fetched milliseconds
+    after we decide — we cannot fill on a book we have not fetched, and "we
+    fill at the book as it exists when we see it" is the honest model. Requiring
+    the book to be strictly earlier would reject every real fill. So the guard
+    compares in **milliseconds** (a second-resolution decision is treated as
+    occurring at `.000` of that second, the earliest instant it could have been)
+    and rejects anything later than `max_book_lag_seconds`. Live uses 5s, which
+    covers a fetch round trip and still catches a book from minutes later.
+    **Replay and tests use 0**, which requires the book to be provably earlier
+    and closes the truncation hole where a book stamped 400ms after the decision
+    fell into the same whole second and passed.
+
 ---
 
-## 8. Secrets
+## 8. The shadow size ladder
+
+On every in-universe, fresh signal — copies and skips alike — the same walk is
+run against the **same book snapshot** at several sizes: `$1`, `$3`, `$10`, his
+own fill size, and his whole position in that token. It costs no extra API
+calls, touches no cash, and opens no position.
+
+Three questions are kept separate per rung, because collapsing them destroys the
+measurement:
+
+* `filled` — could the book absorb this size at all?
+* `cleared_max_fill` — was the resulting price acceptable?
+* `below_min_order_size` — could the order legally be placed?
+
+Both the price cap and the 5-share minimum are lifted during the walk and judged
+afterwards. **His own trade sizes are frequently under the 5-share floor** once
+the fee comes out of the same budget (his median fill is ~$1.26), so enforcing
+the minimum during the walk would have thrown away the depth measurement from
+the single most informative rung.
+
+### First real measurement (2026-08-20, 3 live books)
+
+| rung | avg size | median depth cost | levels eaten |
+|---|---|---|---|
+| `$1` | $1.00 | +24.0% | 1.7 |
+| `his_fill` | $1.26 | **+0.0%** | 1.2 |
+| `$3` | $3.00 | **+70.0%** | 3.4 |
+| `his_position` | $3.41 | +10.5% | 1.8 |
+| `$10` | $10.00 | +183.7% | 6.2 |
+
+n is far too small to conclude anything, and this is a cold-start sample where
+most books were empty. But the shape is the thing to watch: **his size moves
+these books ~0%, ours moves them ~70%.** If that holds up over a real sample,
+size is the binding constraint, not selection — and his edge may partly be an
+artifact of being small enough not to move the market.
+
+---
+
+## 9. The mark path
+
+Marks are stored as **rows** in a `marks` table, not as a single overwritten
+field. A single overwritten mark makes CLV all-or-nothing on one capture landing
+in the window before the book empties.
+
+With the full path, CLV is also computed at fixed horizons after entry (15, 60,
+360 minutes by default). Fixed horizons are **always** capturable because the
+book is still live at those points, so a failed closing-line capture no longer
+costs the entire measurement for that trade. It also distinguishes a price that
+drifts our way at +1h but gives it back by close from one that never moves at
+all.
+
+Only book-derived marks (`book_mid`, `book_bid`) qualify for either the closing
+line or a horizon measurement. A gamma price for a resolved market is 0 or 1 —
+the outcome, not a market price — and using it would turn CLV into a restatement
+of the result.
+
+**Growth:** ~10 new positions/day × ~288 marks each (5-minute cadence over a
+~24h weather market) is roughly 3k rows/day, ~1M/year. Trivial for SQLite with
+the index on `(position_id, ts)`, and comfortable on a t3.small.
+
+---
+
+## 10. Secrets
 
 No API keys, private keys, or secrets appear in the code or in `config.yaml`, and
 none are needed for paper mode — all three endpoints used are public and
@@ -360,9 +445,15 @@ dashboard off localhost. Don't set it.
 
 ---
 
-## 9. Still open
+## 11. Still open
 
 - Whether a disputed UMA resolution can reverse a settlement we already booked.
 - Whether `feeSchedule.exponent` is ever ≠ 1 (never observed; unhandled).
 - Whether `/activity` back-fills late rows (bot is insensitive either way).
 - The real rate limit on `/activity` specifically.
+- Whether `POST /books` and `GET /book` ever disagree about a token having a
+  book. Both are treated as "no book" so a disagreement is harmless, but it has
+  not been checked.
+- The strategy's real latency slippage. Still unmeasurable retrospectively; the
+  cold-start run produced only 3 fills and those carried a +124% average, which
+  is a sample of three against a book that had moved, not a slippage estimate.

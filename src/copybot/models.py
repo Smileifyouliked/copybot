@@ -275,6 +275,7 @@ class FillResult:
     would_be_avg_price: float = 0.0      # VWAP we'd have got, even when skipping
     is_partial: bool = False
     book_timestamp_ms: int = 0
+    book_lag_ms: float | None = None  # ms between decision and book stamp
     tick_size: float = 0.0
     min_order_size: float = 0.0
 

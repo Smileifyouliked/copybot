@@ -29,7 +29,7 @@ import dataclasses
 
 from copybot.config import load_config
 from copybot.fees import FeeModel
-from copybot.fills import simulate_buy, simulate_sell
+from copybot.fills import simulate_buy, simulate_sell, size_ladder
 from copybot.models import BookLevel, MarketMeta, OrderBook
 
 
@@ -79,12 +79,18 @@ class FakeExecutor:
         book = book if book is not None else self.get_book(token_id)
         self.calls.append(("buy", token_id, usd_amount))
         return simulate_buy(book, usd_amount, self.fee, max_fill_price=0.50,
-                            decision_ts=decision_ts)
+                            decision_ts=decision_ts, max_book_lag_seconds=3600)
 
     def sell(self, token_id, shares, *, book=None, decision_ts=None):
         book = book if book is not None else self.get_book(token_id)
         self.calls.append(("sell", token_id, shares))
-        return simulate_sell(book, shares, self.fee, decision_ts=decision_ts)
+        return simulate_sell(book, shares, self.fee, decision_ts=decision_ts,
+                             max_book_lag_seconds=3600)
+
+    def shadow_ladder(self, book, rungs, *, decision_ts=None):
+        self.calls.append(("ladder", book.token_id, len(rungs)))
+        return size_ladder(book, rungs, self.fee, max_fill_price=0.50,
+                           decision_ts=decision_ts, max_book_lag_seconds=3600)
 
 
 class FakeClient:

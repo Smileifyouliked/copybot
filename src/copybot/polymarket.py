@@ -39,6 +39,16 @@ class PolymarketError(Exception):
     """A request failed after exhausting retries."""
 
 
+class NotFound(PolymarketError):
+    """The resource does not exist. Permanent -- never retried.
+
+    CLOB /book returns 404 for a token with no book (a resolved market), which
+    is the single-fetch counterpart of POST /books omitting the same token. It
+    is a normal state, not an error, and retrying it burns the whole backoff
+    ladder on something that can never succeed.
+    """
+
+
 @dataclass
 class _Cached:
     value: Any
@@ -83,6 +93,12 @@ class PolymarketClient:
         for attempt in range(self.max_retries):
             try:
                 resp = self._client.request(method, url, **kwargs)
+                if resp.status_code == 404:
+                    raise NotFound(f"404 {url.split('?')[0]}")
+                if 400 <= resp.status_code < 500 and resp.status_code != 429:
+                    raise PolymarketError(
+                        f"HTTP {resp.status_code} {url.split('?')[0]}: {resp.text[:200]}"
+                    )
                 if resp.status_code == 429 or resp.status_code >= 500:
                     retry_after = resp.headers.get("retry-after")
                     delay = (
@@ -132,10 +148,25 @@ class PolymarketClient:
 
     # -- books -------------------------------------------------------------
     def get_book(self, token_id: str) -> OrderBook:
-        data = self._request("GET", f"{CLOB_API}/book", params={"token_id": token_id})
+        """A token with no book yields an EMPTY book, not an exception.
+
+        Resolved markets 404 here. That is a normal, expected state -- the same
+        one POST /books signals by omission -- so it is represented as an empty
+        book carrying its own token_id, which every caller already handles.
+        """
+        try:
+            data = self._request("GET", f"{CLOB_API}/book", params={"token_id": token_id})
+        except NotFound:
+            log.info("no book for token %s (resolved or never listed)", token_id[:16])
+            return self._empty_book(token_id)
         if not isinstance(data, dict):
             raise PolymarketError("/book returned a non-object")
         return OrderBook.from_clob(data, token_id=token_id)
+
+    @staticmethod
+    def _empty_book(token_id: str) -> OrderBook:
+        return OrderBook(token_id=token_id, bids=[], asks=[], tick_size=0.001,
+                         min_order_size=5.0, timestamp_ms=0)
 
     def get_books(self, token_ids: Sequence[str]) -> dict[str, OrderBook]:
         """Batch book fetch. Used to mark up to ~50 open positions in one or
@@ -158,6 +189,7 @@ class PolymarketClient:
                         out[t] = self.get_book(t)
                     except PolymarketError as inner:
                         log.warning("book fetch failed for %s: %s", t[:16], inner)
+                        out[t] = self._empty_book(t)
                 continue
             books = [
                 OrderBook.from_clob(e) for e in (data if isinstance(data, list) else [])
@@ -174,10 +206,7 @@ class PolymarketClient:
                 # Absent means "no book", which is a real state, not an error.
                 # Recorded as an explicitly empty book so callers cannot
                 # mistake it for a book they simply failed to look up.
-                out[token_id] = OrderBook(
-                    token_id=token_id, bids=[], asks=[],
-                    tick_size=0.001, min_order_size=5.0, timestamp_ms=0,
-                )
+                out[token_id] = self._empty_book(token_id)
         return out
 
     # -- markets -----------------------------------------------------------

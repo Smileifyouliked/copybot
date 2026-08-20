@@ -94,12 +94,19 @@ class Strategy:
             counters.ignored += 1
 
     def _skip(self, trade: TargetTrade, reason: SkipReason, counters: PollCounters,
-              detail: str = "", best_price=None, would_be_fill=None) -> None:
+              detail: str = "", best_price=None, would_be_fill=None,
+              book=None, rungs=None) -> None:
         with self.db.tx() as conn:
             self.db.record_processed(trade, "skipped", conn=conn)
             self.db.record_skip(reason, trade=trade, question=trade.title,
                                 detail=detail, best_price=best_price,
                                 would_be_fill=would_be_fill, conn=conn)
+            if rungs:
+                self.db.record_shadow_ladder(
+                    conn, rungs, trade=trade, book=book, question=trade.title,
+                    outcome=f"skipped:{reason.value}",
+                    his_usd_size=trade.usd_size,
+                )
         counters.skip(reason)
         log.info("SKIP %s %s @ %.4f -- %s: %s", trade.side.value,
                  trade.title[:44] or trade.token_id[:16], trade.price,
@@ -125,6 +132,14 @@ class Strategy:
                 f"{self.cfg.max_trade_age_seconds}s (downtime catch-up)",
             )
 
+        # From here a book is worth fetching: the signal is in-universe and
+        # fresh, so even if we decline to act, the capacity curve is real data.
+        decision_ts = self._now()
+        book = self.executor.get_book(trade.token_id)
+        rungs = self.executor.shadow_ladder(
+            book, self._ladder_rungs(trade), decision_ts=decision_ts
+        )
+
         copies = self.db.count_copies_for_token(trade.token_id)
         if copies >= self.cfg.max_copies_per_token:
             # We are not copying this fill, but he is still scaling in. His
@@ -135,6 +150,7 @@ class Strategy:
                 trade, SkipReason.ALREADY_AT_MAX_COPIES, counters,
                 f"already hold {copies} copy/copies of this token "
                 f"(max {self.cfg.max_copies_per_token})",
+                book=book, rungs=rungs,
             )
             self._refresh_his_position(trade.token_id)
             return
@@ -144,18 +160,20 @@ class Strategy:
             return self._skip(
                 trade, SkipReason.NOT_ENOUGH_CASH, counters,
                 f"free cash ${cash:.2f} is below the ${self.cfg.stake_per_copy_usd:.2f} stake",
+                book=book, rungs=rungs,
             )
 
-        # Decision moment. The book is fetched now, inside the executor, and
-        # every price used from here comes from that snapshot.
-        decision_ts = self._now()
+        # The real decision uses the SAME snapshot the ladder was measured on,
+        # so the two are directly comparable and no second fetch can slip a
+        # different (possibly better) book into the fill.
         fill = self.executor.buy(trade.token_id, self.cfg.stake_per_copy_usd,
-                                 decision_ts=decision_ts)
+                                 book=book, decision_ts=decision_ts)
         if not fill.filled:
             return self._skip(
                 trade, fill.skip_reason or SkipReason.BOOK_TOO_THIN, counters,
                 fill.detail, best_price=fill.best_price,
                 would_be_fill=fill.would_be_avg_price,
+                book=book, rungs=rungs,
             )
 
         band = entry_band(fill.avg_price)
@@ -216,6 +234,15 @@ class Strategy:
                 slippage_vs_his_entry=slip_abs,
                 slippage_vs_his_entry_pct=slip_pct,
             )
+            self.db.record_shadow_ladder(
+                conn, rungs, trade=trade, book=book, question=trade.title,
+                outcome="copied", his_usd_size=trade.usd_size,
+            )
+            self.db.record_mark(
+                conn, position_id, trade.token_id, decision_ts,
+                book.best_bid, book.best_ask, fill.avg_price, book.spread,
+                MarkSource.ENTRY_PRICE.value,
+            )
 
         counters.copied += 1
         log.info("BUY  $%.2f -> %.4f shares @ %.4f (he paid %.4f, %+.1f%%, "
@@ -226,6 +253,22 @@ class Strategy:
         if slip_pct > self.cfg.slippage_warn_pct:
             log.warning("SLIPPAGE %+.1f%% on %s -- above the %.0f%% warning level",
                         slip_pct, trade.title[:44], self.cfg.slippage_warn_pct)
+
+    def _ladder_rungs(self, trade: TargetTrade) -> list[tuple[str, float]]:
+        """Fixed rungs plus his own size.
+
+        The rung at his size is the sharpest one: it says whether his edge is
+        genuine or an artifact of trading small enough not to move the book.
+        """
+        rungs = [(f"${usd:g}", float(usd)) for usd in self.cfg.shadow_ladder_usd]
+        if self.cfg.shadow_ladder_include_his_sizes:
+            if trade.usd_size > 0:
+                rungs.append(("his_fill", trade.usd_size))
+            _, _, _, his_usd = self.db.his_vwap_entry(trade.token_id)
+            his_position = (his_usd or 0.0) + trade.usd_size
+            if his_position > 0:
+                rungs.append(("his_position", his_position))
+        return rungs
 
     def _refresh_his_position(self, token_id: str) -> None:
         """Recompute his side of an open position after he adds a fill.
@@ -484,6 +527,13 @@ class Strategy:
 
                 with self.db.tx() as conn:
                     self.db.update_position(conn, position["id"], **updates)
+                    # The full path, not just the latest value: fixed-horizon
+                    # CLV needs history, and horizons are always capturable
+                    # because the book is still live at those points.
+                    self.db.record_mark(
+                        conn, position["id"], position["token_id"], ts,
+                        bid, ask, price, spread, source.value,
+                    )
                 stats[source.value] = stats.get(source.value, 0) + 1
             except Exception:
                 log.exception("marking failed for position %s; continuing",

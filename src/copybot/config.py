@@ -42,6 +42,7 @@ class Config:
     max_copies_per_token: int
     max_trade_age_seconds: int
     poll_interval_seconds: int
+    activity_fetch_limit: int
     mirror_partial_sells: bool
     fee_rate_fallback: float
     fee_bps_override: float | None
@@ -58,6 +59,10 @@ class Config:
     near_close_window_seconds: int
     mark_interval_near_close_seconds: int
     clv_max_spread: float
+    max_book_lag_seconds: float
+    shadow_ladder_usd: list
+    shadow_ladder_include_his_sizes: bool
+    clv_horizons_minutes: list
     slippage_warn_pct: float
     respect_min_order_size: bool
     raw: dict[str, Any] = field(default_factory=dict, repr=False)
@@ -92,6 +97,7 @@ _REQUIRED = (
 
 _DEFAULTS: dict[str, Any] = {
     "fee_bps_override": None,
+    "activity_fetch_limit": 100,
     "dashboard_host": "127.0.0.1",
     "db_path": "data/copybot.sqlite3",
     "log_path": "logs/copybot.log",
@@ -105,6 +111,10 @@ _DEFAULTS: dict[str, Any] = {
     "near_close_window_seconds": 1800,
     "mark_interval_near_close_seconds": 60,
     "clv_max_spread": 0.05,
+    "max_book_lag_seconds": 5.0,
+    "shadow_ladder_usd": [1.00, 3.00, 10.00],
+    "shadow_ladder_include_his_sizes": True,
+    "clv_horizons_minutes": [15, 60, 360],
 }
 
 
@@ -186,6 +196,7 @@ def _validate(cfg: Config) -> None:
         "max_copies_per_token",
         "max_trade_age_seconds",
         "poll_interval_seconds",
+        "activity_fetch_limit",
         "resolution_check_interval_seconds",
         "equity_snapshot_interval_seconds",
         "mark_interval_seconds",
@@ -194,6 +205,13 @@ def _validate(cfg: Config) -> None:
     ):
         if getattr(cfg, name) <= 0:
             raise ConfigError(f"{name} must be > 0")
+
+    if not cfg.shadow_ladder_usd or any(v <= 0 for v in cfg.shadow_ladder_usd):
+        raise ConfigError("shadow_ladder_usd must be a non-empty list of positive amounts")
+    if any(v <= 0 for v in cfg.clv_horizons_minutes):
+        raise ConfigError("clv_horizons_minutes must all be positive")
+    if cfg.max_book_lag_seconds < 0:
+        raise ConfigError("max_book_lag_seconds must be >= 0")
 
     if not (0 < cfg.dashboard_port < 65536):
         raise ConfigError(f"dashboard_port out of range: {cfg.dashboard_port}")

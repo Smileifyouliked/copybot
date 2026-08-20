@@ -1,0 +1,381 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>copybot</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root{
+    --bg:#f6f7f9; --card:#fff; --ink:#16181d; --muted:#6b7280; --line:#e5e7eb;
+    --up:#0f7b3f; --down:#b91c1c; --warn:#b45309; --accent:#2563eb;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{ --bg:#0f1115; --card:#181b21; --ink:#e8eaed; --muted:#9aa1ab;
+           --line:#2a2f38; --up:#4ade80; --down:#f87171; --warn:#fbbf24; --accent:#60a5fa; }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;padding:24px 16px 64px;background:var(--bg);color:var(--ink);
+       font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  .wrap{max-width:940px;margin:0 auto}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;
+        padding:20px;margin-bottom:16px}
+  h2{font-size:17px;margin:0 0 14px;font-weight:650}
+  h3{font-size:14px;margin:18px 0 8px;color:var(--muted);font-weight:600}
+  .huge{font-size:46px;font-weight:700;letter-spacing:-1px;margin:0}
+  .sub{font-size:22px;font-weight:650;margin:6px 0 0}
+  .up{color:var(--up)} .down{color:var(--down)} .warn{color:var(--warn)}
+  .muted{color:var(--muted)}
+  .small{font-size:13px}
+  .status{display:flex;align-items:center;gap:10px;font-weight:600}
+  .status .when{font-weight:400;color:var(--muted)}
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  th{text-align:left;color:var(--muted);font-weight:600;font-size:12px;
+     text-transform:uppercase;letter-spacing:.04em;padding:0 8px 8px 0;border-bottom:1px solid var(--line)}
+  td{padding:9px 8px 9px 0;border-bottom:1px solid var(--line);vertical-align:top}
+  tr:last-child td{border-bottom:none}
+  .num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+  .feed{list-style:none;margin:0;padding:0;font-size:14px}
+  .feed li{padding:9px 0 9px 12px;border-bottom:1px solid var(--line);border-left:3px solid transparent}
+  .feed li:last-child{border-bottom:none}
+  .feed .t{color:var(--muted);margin-right:6px}
+  .k-buy{border-left-color:var(--accent)}
+  .k-sell-good,.k-settle-good{border-left-color:var(--up)}
+  .k-sell-bad,.k-settle-bad{border-left-color:var(--down)}
+  .k-skip{border-left-color:var(--line)}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px}
+  .stat{padding:12px 14px;border:1px solid var(--line);border-radius:10px}
+  .stat .v{font-size:24px;font-weight:680;font-variant-numeric:tabular-nums}
+  .stat .l{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+  .banner{padding:12px 14px;border-radius:10px;margin-bottom:16px;font-size:14px;
+          background:rgba(180,83,9,.12);border:1px solid var(--warn);color:var(--warn)}
+  details{margin-top:8px}
+  summary{cursor:pointer;font-weight:650;padding:8px 0}
+  .bar{height:8px;background:var(--line);border-radius:4px;overflow:hidden;min-width:60px}
+  .bar>span{display:block;height:100%;background:var(--accent)}
+  .empty{color:var(--muted);font-style:italic;padding:8px 0}
+  .scroll{overflow-x:auto}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  {% if slippage_warn %}
+  <div class="banner">
+    ⚠️ On average we're paying <strong>{{ "%.0f"|format(slippage.mean_vs_his_entry_pct) }}% more</strong>
+    than the wallet does. Above the {{ "%.0f"|format(cfg.slippage_warn_pct) }}% warning level you set.
+    The bot keeps running — this is a heads-up, not a stop.
+  </div>
+  {% endif %}
+
+  <!-- ============ headline ============ -->
+  <div class="card">
+    <div class="muted small">Your money right now</div>
+    <p class="huge">{{ money(equity) }}</p>
+    <p class="sub {{ 'up' if profit >= 0 else 'down' }}">
+      {{ 'Up' if profit >= 0 else 'Down' }} {{ money(profit|abs) }} since you started
+    </p>
+    <p class="muted small" style="margin:6px 0 0">
+      {{ money(cash) }} in cash · {{ money(positions_value) }} in {{ open_count }} open bet{{ '' if open_count == 1 else 's' }}
+      · started with {{ money(starting) }}
+    </p>
+
+    <!-- expected vs actual winners: the line that separates unlucky from broken -->
+    <p style="margin:14px 0 0;font-size:15px">
+      {% if winners.resolved == 0 %}
+        <span class="muted">No bets have finished yet, so there's nothing to judge.</span>
+      {% else %}
+        <strong>{{ winners.actual }} winner{{ '' if winners.actual == 1 else 's' }}</strong>
+        out of {{ winners.resolved }} finished bets.
+        Pure luck would give about <strong>{{ "%.1f"|format(winners.expected) }}</strong>
+        (anything from {{ "%.0f"|format(winners.low) }} to {{ "%.0f"|format(winners.high) }} is normal).
+        <span class="muted">— {{ winners.verdict }}</span>
+      {% endif %}
+    </p>
+  </div>
+
+  <!-- ============ status ============ -->
+  <div class="card">
+    <div class="status">
+      <span>{% if status == 'ok' %}🟢{% elif status == 'warn' %}🟡{% else %}🔴{% endif %}</span>
+      <span>{{ status_text }}</span>
+      <span class="when">— last checked {{ last_checked }}</span>
+    </div>
+  </div>
+
+  <!-- ============ chart ============ -->
+  <div class="card">
+    <h2>Your money over time</h2>
+    {% if chart_json and chart_json != 'null' %}
+      <canvas id="chart" height="110"></canvas>
+    {% endif %}
+    <p class="empty" id="chart-empty" style="display:none">
+      No history yet — the bot records this every 5 minutes.
+    </p>
+  </div>
+
+  <!-- ============ depth cost: first-class ============ -->
+  <div class="card">
+    <h2>What our own order size costs us</h2>
+    <p class="muted small" style="margin:-8px 0 14px">
+      When we buy, we use up the cheapest shares on offer and have to reach for
+      pricier ones. This is how much worse our price ends up than the best price showing.
+      If this is consistently large, the size of the bet is the problem — not the picking.
+    </p>
+    {% if depth.n == 0 %}
+      <p class="empty">No signals measured yet.</p>
+    {% else %}
+    <div class="grid">
+      <div class="stat"><div class="l">Typical extra cost</div>
+        <div class="v {{ 'down' if depth.median > 15 else '' }}">{{ "%+.1f"|format(depth.median) }}%</div></div>
+      <div class="stat"><div class="l">Bad days (worst 10%)</div>
+        <div class="v">{{ "%+.1f"|format(depth.p90) }}%</div></div>
+      <div class="stat"><div class="l">Cost us nothing</div>
+        <div class="v">{{ depth.free }} / {{ depth.n }}</div></div>
+      <div class="stat"><div class="l">Cost over 15%</div>
+        <div class="v {{ 'down' if depth.over_15pct > depth.n / 4 else '' }}">{{ depth.over_15pct }} / {{ depth.n }}</div></div>
+    </div>
+    <h3>How often each level of extra cost happens</h3>
+    <table>
+      {% for b in depth.buckets %}
+      <tr>
+        <td style="width:110px">{{ b.label }}</td>
+        <td><div class="bar"><span style="width:{{ (100 * b.n / depth.n)|round(1) }}%"></span></div></td>
+        <td class="num" style="width:70px">{{ b.n }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% endif %}
+
+    <h3>What would happen at other bet sizes</h3>
+    <p class="muted small" style="margin:-4px 0 10px">
+      Measured on the same prices at the same moment, without actually betting.
+      Tells you whether $3 is the right size. "Could measure" excludes signals
+      where nobody was selling at all, since those carry no price information.
+    </p>
+    {% if not ladder %}
+      <p class="empty">No signals measured yet.</p>
+    {% else %}
+    <div class="scroll"><table>
+      <tr><th>Bet size</th><th class="num">Signals</th><th class="num">Could measure</th>
+          <th class="num">Typical extra cost</th><th class="num">Price levels used</th>
+          <th class="num">Would have gone through</th></tr>
+      {% for r in ladder %}
+      <tr>
+        <td><strong>{{ r.rung }}</strong>
+            {% if r.rung.startswith('his') %}<span class="muted small">(avg {{ money(r.usd) }} — the wallet's own size)</span>{% endif %}</td>
+        <td class="num">{{ r.n }}</td>
+        <td class="num">{{ r.measured }}</td>
+        <td class="num">{{ ("%+.1f%%"|format(r.median_depth_cost_pct)) if r.median_depth_cost_pct is not none else "—" }}</td>
+        <td class="num">{{ "%.1f"|format(r.mean_levels) if r.mean_levels is not none else "—" }}</td>
+        <td class="num">{{ "%.0f"|format(100 * r.clear_rate) if r.clear_rate is not none else "—" }}%</td>
+      </tr>
+      {% endfor %}
+    </table></div>
+    {% endif %}
+  </div>
+
+  <!-- ============ CLV ============ -->
+  <div class="card">
+    <h2>Did the price move our way after we bought?</h2>
+    <p class="muted small" style="margin:-8px 0 14px">
+      This is the most useful number early on. Wins and losses are too rare to judge for
+      months, but every single bet tells you whether you got in at a good price.
+      Positive means the market moved toward our side after we bought.
+    </p>
+    <div class="grid">
+      <div class="stat"><div class="l">At the finish line</div>
+        <div class="v {{ 'up' if (clv.mean_clv_pct or 0) > 0 else 'down' if clv.mean_clv_pct is not none else '' }}">
+          {{ "%+.1f"|format(clv.mean_clv_pct) if clv.mean_clv_pct is not none else "—" }}{% if clv.mean_clv_pct is not none %}%{% endif %}
+        </div></div>
+      {% for h in clv_horizons %}
+      <div class="stat"><div class="l">After {{ h.horizon_minutes }} min</div>
+        <div class="v {{ 'up' if (h.mean_clv_pct or 0) > 0 else 'down' if h.mean_clv_pct is not none else '' }}">
+          {{ "%+.1f"|format(h.mean_clv_pct) if h.mean_clv_pct is not none else "—" }}{% if h.mean_clv_pct is not none %}%{% endif %}
+        </div>
+        <div class="l" style="margin-top:4px">{{ h.measured }} measured</div></div>
+      {% endfor %}
+    </div>
+    <p class="small" style="margin:14px 0 0" {% if clv.capture_rate is not none and clv.capture_rate < 0.8 %}class="warn"{% endif %}>
+      {% if clv.closed == 0 %}
+        <span class="muted">Nothing has finished yet.</span>
+      {% else %}
+        Captured a final price for {{ clv.captured }} of {{ clv.closed }} finished bets
+        ({{ "%.0f"|format(100 * clv.capture_rate) }}%).
+        {% if clv.failures > 0 %}
+          <span class="warn">{{ clv.failures }} missed — if this stays high, this number can't be trusted.</span>
+        {% endif %}
+        {% if clv.wide_spread %}
+          <span class="muted">{{ clv.wide_spread }} had prices too spread out to be reliable.</span>
+        {% endif %}
+      {% endif %}
+    </p>
+  </div>
+
+  <!-- ============ holdings ============ -->
+  <div class="card">
+    <h2>Bets you're currently holding</h2>
+    {% if not holdings %}
+      <p class="empty">Nothing open right now.</p>
+    {% else %}
+    <div class="scroll"><table>
+      <tr><th>What the bet is</th><th class="num">You paid</th><th class="num">Worth now</th>
+          <th class="num">Up / down</th><th class="num">Held for</th></tr>
+      {% for h in holdings %}
+      <tr>
+        <td>{{ h.question }}
+            <div class="muted small">betting "{{ h.outcome }}" · bought at {{ h.bought_at }} · now {{ h.now_at }}</div></td>
+        <td class="num">{{ money(h.paid) }}</td>
+        <td class="num">{{ money(h.worth) }}</td>
+        <td class="num {{ 'up' if h.change >= 0 else 'down' }}">
+          {{ '+' if h.change >= 0 else '−' }}{{ money(h.change|abs) }}</td>
+        <td class="num muted">{{ h.held }}</td>
+      </tr>
+      {% endfor %}
+    </table></div>
+    {% endif %}
+  </div>
+
+  <!-- ============ feed ============ -->
+  <div class="card">
+    <h2>What the bot did recently</h2>
+    {% if not feed %}
+      <p class="empty">Nothing yet.</p>
+    {% else %}
+    <ul class="feed">
+      {% for f in feed %}
+      <li class="k-{{ f.kind }}"><span class="t">{{ f.time }}</span>{{ f.text }}</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  </div>
+
+  <!-- ============ nerds ============ -->
+  <div class="card">
+    <details>
+      <summary>Details for nerds</summary>
+
+      <h3>By entry price band</h3>
+      <div class="scroll"><table>
+        <tr><th>Band</th><th class="num">Bets</th><th class="num">Finished</th><th class="num">Winners</th>
+            <th class="num">Staked</th><th class="num">P&amp;L</th><th class="num">Return</th>
+            <th class="num">Avg slippage</th><th class="num">Avg CLV</th></tr>
+        {% for b in bands %}
+        <tr><td>{{ b.bucket }}</td><td class="num">{{ b.n }}</td><td class="num">{{ b.closed }}</td>
+            <td class="num">{{ b.winners }}</td><td class="num">{{ money(b.staked) }}</td>
+            <td class="num {{ 'up' if b.pnl >= 0 else 'down' }}">{{ money(b.pnl) }}</td>
+            <td class="num">{{ "%+.1f"|format(b.return_pct) if b.return_pct is not none else "—" }}%</td>
+            <td class="num">{{ "%+.1f"|format(b.slippage_pct) if b.slippage_pct is not none else "—" }}%</td>
+            <td class="num">{{ "%+.1f"|format(b.clv_pct) if b.clv_pct is not none else "—" }}%</td></tr>
+        {% else %}<tr><td colspan="9" class="empty">No bets yet.</td></tr>{% endfor %}
+      </table></div>
+
+      <h3>By how the bet ended</h3>
+      <p class="muted small" style="margin:-4px 0 8px">
+        Held to the end pays trading fees once. Sold early pays them twice —
+        about 4.75% versus 9.5% at the prices this wallet trades.
+      </p>
+      <div class="scroll"><table>
+        <tr><th>Exit</th><th class="num">Bets</th><th class="num">Staked</th>
+            <th class="num">P&amp;L</th><th class="num">Return</th></tr>
+        {% for e in exit_paths %}
+        <tr><td>{{ 'Held to the end' if e.bucket == 'resolution' else 'Sold when he sold' }}</td>
+            <td class="num">{{ e.n }}</td><td class="num">{{ money(e.staked) }}</td>
+            <td class="num {{ 'up' if e.pnl >= 0 else 'down' }}">{{ money(e.pnl) }}</td>
+            <td class="num">{{ "%+.1f"|format(e.return_pct) if e.return_pct is not none else "—" }}%</td></tr>
+        {% else %}<tr><td colspan="5" class="empty">Nothing finished yet.</td></tr>{% endfor %}
+      </table></div>
+
+      <h3>Slippage and size</h3>
+      <table>
+        <tr><td>Average slippage vs his fill</td><td class="num">{{ pct(slippage.mean_vs_his_entry_pct) }}</td></tr>
+        <tr><td>Average slippage vs his average entry</td><td class="num">{{ pct(slippage.mean_vs_his_vwap_pct) }}</td></tr>
+        <tr><td>Copies more than 15% worse than his</td><td class="num">{{ slippage.n_worse_than_15pct }} / {{ slippage.n }}</td></tr>
+        <tr><td>Our size vs the fill we copied</td>
+            <td class="num">{{ "%.1f"|format(slippage.mean_size_ratio_vs_first_fill) if slippage.mean_size_ratio_vs_first_fill else "—" }}×</td></tr>
+        <tr><td>Our size vs his whole position</td>
+            <td class="num">{{ "%.1f"|format(slippage.mean_size_ratio_vs_his_position) if slippage.mean_size_ratio_vs_his_position else "—" }}×</td></tr>
+      </table>
+
+      <h3>Fees</h3>
+      <table>
+        <tr><td>Total paid in fees</td><td class="num">{{ money(fees.total_fees_usd) }}</td></tr>
+        <tr><td>As a share of money traded</td><td class="num">{{ pct(fees.fee_pct_of_gross) }}</td></tr>
+        <tr><td>Trades where the fee rate had to be guessed</td>
+            <td class="num {{ 'warn' if fees.fee_rate_fallbacks else '' }}">{{ fees.fee_rate_fallbacks }} / {{ fees.n_trades }}</td></tr>
+      </table>
+
+      <h3>Why we skipped trades</h3>
+      <table>
+        {% for reason, n in skips %}
+        <tr><td>{{ reason.replace('_', ' ') }}</td><td class="num">{{ n }}</td></tr>
+        {% else %}<tr><td class="empty">None yet.</td></tr>{% endfor %}
+      </table>
+
+      <h3>Config in force</h3>
+      <table>
+        <tr><td>Mode</td><td class="num">{{ cfg.mode }}</td></tr>
+        <tr><td>Wallet followed</td><td class="num small">{{ cfg.target_wallet }}</td></tr>
+        <tr><td>Stake per copy</td><td class="num">{{ money(cfg.stake_per_copy_usd) }}</td></tr>
+        <tr><td>Max entry price</td><td class="num">{{ cents(cfg.max_entry_price) }}</td></tr>
+        <tr><td>Poll interval</td><td class="num">{{ cfg.poll_interval_seconds }}s</td></tr>
+      </table>
+    </details>
+  </div>
+
+  <p class="muted small" style="text-align:center">
+    Page refreshes every 10 seconds · times in UTC · generated {{ now }}
+  </p>
+</div>
+
+<script>
+  // Restore scroll across the auto-refresh so tables stay readable.
+  try {
+    const y = sessionStorage.getItem('copybot-scroll');
+    if (y) window.scrollTo(0, parseInt(y, 10));
+    window.addEventListener('beforeunload', function () {
+      sessionStorage.setItem('copybot-scroll', String(window.scrollY));
+    });
+  } catch (e) {}
+  setTimeout(function () { location.reload(); }, 10000);
+
+  (function () {
+    const data = {{ chart_json|safe }};
+    const el = document.getElementById('chart');
+    if (!el) return;
+    if (!data || !data.values || data.values.length < 2) {
+      el.style.display = 'none';
+      const empty = document.getElementById('chart-empty');
+      if (empty) empty.style.display = 'block';
+      return;
+    }
+    const css = getComputedStyle(document.documentElement);
+    const accent = css.getPropertyValue('--accent').trim() || '#2563eb';
+    new Chart(el.getContext('2d'), {
+      type: 'line',
+      data: {
+        labels: data.labels,
+        datasets: [
+          { label: 'Your money', data: data.values, borderColor: accent,
+            backgroundColor: accent + '22', fill: true, tension: 0.25,
+            pointRadius: 0, borderWidth: 2 },
+          { label: 'What you started with', data: data.values.map(() => data.start),
+            borderColor: css.getPropertyValue('--muted').trim() || '#888',
+            borderDash: [5, 5], pointRadius: 0, borderWidth: 1, fill: false }
+        ]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: true, animation: false,
+        interaction: { intersect: false, mode: 'index' },
+        plugins: { legend: { display: false },
+                   tooltip: { callbacks: { label: c => '$' + c.parsed.y.toFixed(2) } } },
+        scales: {
+          y: { ticks: { callback: v => '$' + v }, grid: { color: css.getPropertyValue('--line').trim() } },
+          x: { ticks: { maxTicksLimit: 8 }, grid: { display: false } }
+        }
+      }
+    });
+  })();
+</script>
+</body>
+</html>

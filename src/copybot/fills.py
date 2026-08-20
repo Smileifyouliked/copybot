@@ -40,6 +40,7 @@ The rules, and what enforces each one:
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
 from .fees import FeeModel
 from .models import FillResult, OrderBook, SkipReason
@@ -55,21 +56,51 @@ class LookAheadError(Exception):
     """A book timestamped after the decision moment reached the simulator."""
 
 
-def assert_no_look_ahead(book: OrderBook, decision_ts: int | None) -> None:
-    """Reject a book from the future relative to our decision.
+def book_lag_ms(book: OrderBook, decision_ts: int | None,
+                decision_ts_ms: float | None = None) -> float | None:
+    """How many milliseconds after the decision the book was stamped.
 
-    The CLOB stamps books in milliseconds; /activity is in seconds. Mixing the
-    two is the easy way to accidentally introduce look-ahead, so the comparison
-    is done explicitly in seconds.
+    The CLOB stamps books in milliseconds; /activity is in seconds. A
+    second-resolution decision is treated as occurring at `.000` of that second,
+    which is the earliest instant it could have been -- the conservative
+    reading. So a book stamped a few hundred ms into the same second yields a
+    positive lag rather than truncating to zero and slipping through.
     """
-    if decision_ts is None or not book.timestamp_ms:
-        return
-    book_ts = book.timestamp_ms / 1000.0
-    if book_ts > decision_ts + 1.0:  # 1s tolerance for clock skew
+    if not book.timestamp_ms:
+        return None
+    if decision_ts_ms is None:
+        if decision_ts is None:
+            return None
+        decision_ts_ms = decision_ts * 1000.0
+    return book.timestamp_ms - decision_ts_ms
+
+
+def assert_no_look_ahead(book: OrderBook, decision_ts: int | None,
+                         max_lag_seconds: float = 0.0,
+                         decision_ts_ms: float | None = None) -> float | None:
+    """Bound how far AFTER the decision moment the book may be stamped.
+
+    A live fill legitimately uses a book fetched milliseconds after we decide --
+    we cannot fill on a book we have not fetched yet, and "we fill at the book
+    as it exists when we see it" is the honest model. So the guard is not "the
+    book must precede the decision" but "the book must not postdate it by more
+    than the time it takes to fetch one".
+
+    `max_lag_seconds=0` is the strict setting for replay and tests: the book
+    must be *provably* earlier, compared in milliseconds, so a book stamped
+    later within the same wall-clock second is rejected rather than truncating
+    into a pass.
+    """
+    lag = book_lag_ms(book, decision_ts, decision_ts_ms)
+    if lag is None:
+        return None
+    if lag >= max_lag_seconds * 1000.0:
         raise LookAheadError(
-            f"book for {book.token_id[:16]}… is stamped {book_ts - decision_ts:.1f}s "
-            f"after the decision moment; that is look-ahead"
+            f"book for {book.token_id[:16]}… is stamped {lag:.0f}ms after the "
+            f"decision moment (allowed lag {max_lag_seconds * 1000:.0f}ms); "
+            f"that is look-ahead"
         )
+    return lag
 
 
 def validate_tick_alignment(book: OrderBook) -> bool:
@@ -112,6 +143,7 @@ def simulate_buy(
     respect_min_order_size: bool = True,
     min_order_size_override: float | None = None,
     decision_ts: int | None = None,
+    max_book_lag_seconds: float = 0.0,
 ) -> FillResult:
     """Simulate spending exactly `budget_usd` of cash buying into `book`.
 
@@ -123,7 +155,7 @@ def simulate_buy(
     All-or-nothing: if the book cannot absorb the whole budget, this returns a
     skip carrying the depth that *was* available, never a partial fill.
     """
-    assert_no_look_ahead(book, decision_ts)
+    lag = assert_no_look_ahead(book, decision_ts, max_book_lag_seconds)
     validate_tick_alignment(book)
 
     min_size = (
@@ -142,6 +174,7 @@ def simulate_buy(
         min_order_size=min_size,
         fee_rate_used=fee.rate,
         fee_rate_was_fallback=fee.was_fallback,
+        book_lag_ms=lag,
     )
 
     if not book.asks:
@@ -240,6 +273,7 @@ def simulate_sell(
     respect_min_order_size: bool = True,
     min_order_size_override: float | None = None,
     decision_ts: int | None = None,
+    max_book_lag_seconds: float = 0.0,
 ) -> FillResult:
     """Simulate selling `shares_to_sell` into the bid side.
 
@@ -249,7 +283,7 @@ def simulate_sell(
     into a thin book is exactly the situation where a paper bot flatters itself,
     so the achieved VWAP is reported honestly however ugly it is.
     """
-    assert_no_look_ahead(book, decision_ts)
+    lag = assert_no_look_ahead(book, decision_ts, max_book_lag_seconds)
     validate_tick_alignment(book)
 
     min_size = (
@@ -268,6 +302,7 @@ def simulate_sell(
         min_order_size=min_size,
         fee_rate_used=fee.rate,
         fee_rate_was_fallback=fee.was_fallback,
+        book_lag_ms=lag,
     )
 
     if not book.bids:
@@ -328,3 +363,91 @@ def simulate_sell(
         ),
         **base,
     )
+
+
+# =========================================================================
+# Shadow size ladder
+# =========================================================================
+
+@dataclass(frozen=True)
+class LadderRung:
+    """One size simulated against a book snapshot, for measurement only."""
+
+    label: str
+    usd: float
+    filled: bool
+    shares: float
+    vwap: float
+    depth_cost_pct: float | None   # vs the best ask on the same snapshot
+    levels_consumed: int
+    cleared_max_fill: bool
+    below_min_order_size: bool     # measurable, but unplaceable on the exchange
+    fee_usd: float
+    skip_reason: str | None
+
+
+def size_ladder(
+    book: OrderBook,
+    rungs: "list[tuple[str, float]]",
+    fee: FeeModel,
+    *,
+    max_fill_price: float,
+    respect_min_order_size: bool = True,
+    decision_ts: int | None = None,
+    max_book_lag_seconds: float = 0.0,
+) -> list[LadderRung]:
+    """Simulate several order sizes against ONE book snapshot.
+
+    Pure measurement: touches no cash, opens no position, issues no request.
+    It is the same walk as a real fill, on the same snapshot, at other sizes --
+    so it costs nothing and yields a capacity curve for the strategy.
+
+    Three separate questions, kept separate, because collapsing them destroys
+    the measurement:
+
+      * `filled`               -- could the book absorb this size at all?
+      * `cleared_max_fill`     -- was the resulting price acceptable?
+      * `below_min_order_size` -- could the order legally be placed?
+
+    Both the price cap and the minimum order size are lifted during the walk and
+    judged afterwards. A rung below the exchange minimum is unplaceable but its
+    depth cost is still real and still worth knowing -- that is exactly the case
+    for his own trade sizes, which are frequently under the 5-share floor once
+    fees are taken out of the same budget.
+    """
+    best_ask = book.best_ask
+    out: list[LadderRung] = []
+    for label, usd in rungs:
+        if usd <= 0:
+            continue
+        r = simulate_buy(
+            book, usd, fee,
+            max_fill_price=1.0,          # lifted on purpose; judged below
+            respect_min_order_size=False,  # ditto -- measurement, not an order
+            decision_ts=decision_ts,
+            max_book_lag_seconds=max_book_lag_seconds,
+        )
+        vwap_price = r.avg_price if r.filled else r.would_be_avg_price
+        depth_cost = (
+            (vwap_price - best_ask) / best_ask * 100.0
+            if best_ask and vwap_price > 0 else None
+        )
+        below_min = bool(
+            respect_min_order_size and r.filled and r.shares < r.min_order_size
+        )
+        out.append(LadderRung(
+            label=label,
+            usd=usd,
+            filled=r.filled,
+            shares=r.shares,
+            vwap=vwap_price,
+            depth_cost_pct=depth_cost,
+            levels_consumed=r.levels_consumed,
+            cleared_max_fill=bool(
+                r.filled and vwap_price <= max_fill_price and not below_min
+            ),
+            below_min_order_size=below_min,
+            fee_usd=r.fee_usd,
+            skip_reason=r.skip_reason.value if r.skip_reason else None,
+        ))
+    return out

@@ -308,3 +308,65 @@ def test_sell_fee_reduces_proceeds():
     assert paid.net_usd < free.net_usd
     assert paid.fee_usd == pytest.approx(100 * 0.05 * 0.95 * 0.05)
     assert paid.net_usd == pytest.approx(free.net_usd - paid.fee_usd)
+
+
+# --- Level consumption order, stated explicitly ----------------------------
+# Ask ordering has been a landmine in this codebase, so this is pinned rather
+# than left to prose. Two separate claims:
+#   (a) levels are ALWAYS consumed cheapest-first;
+#   (b) the walk does NOT abort when a level crosses our_max_fill_price -- it
+#       keeps going so it can compute the true average, and the cap is applied
+#       to that average afterwards.
+
+def test_levels_are_consumed_cheapest_first(monkeypatch):
+    """Record the order the walk touches prices in."""
+    import copybot.fills as fills_mod
+
+    seen = []
+    real = fills_mod.FeeModel.per_share
+
+    def spy(self, price):
+        seen.append(price)
+        return real(self, price)
+
+    monkeypatch.setattr(fills_mod.FeeModel, "per_share", spy)
+    simulate_buy(book(asks=[(0.30, 5), (0.10, 5), (0.20, 5)]), 3.00,
+                 FeeModel(rate=0.05), max_fill_price=0.90)
+    assert seen == sorted(seen), f"levels touched out of order: {seen}"
+    assert seen[0] == pytest.approx(0.10)
+
+
+def test_walk_does_not_abort_when_a_level_crosses_the_cap():
+    """2 @ 0.10 then deep at 0.90, cap 0.50. If the walk aborted at the 0.90
+    level it would report a 0.10 average and a thin book. It must instead
+    consume through and report the true average, then reject on it."""
+    r = simulate_buy(book(asks=[(0.10, 2), (0.90, 10_000)]), 3.00, NO_FEE,
+                     max_fill_price=0.50)
+    assert not r.filled
+    assert r.skip_reason is SkipReason.FILL_ABOVE_MAX
+    assert r.skip_reason is not SkipReason.BOOK_TOO_THIN
+    # 2 @ 0.10 = 0.20, then 2.80/0.90 = 3.111 shares -> 5.111 shares for $3.00
+    assert r.would_be_avg_price == pytest.approx(3.00 / (2 + 2.80 / 0.90))
+    assert r.would_be_avg_price == pytest.approx(0.5870, abs=1e-4)
+    assert r.would_be_avg_price > 0.50
+    assert r.levels_consumed == 0, "a rejected fill consumes nothing"
+
+
+def test_a_deep_cheap_level_can_absorb_an_expensive_one():
+    """The mirror case, and the reason the cap must be tested on the average
+    rather than per level: 5 @ 0.10 then 0.90 still averages 0.386, which is
+    genuinely under the cap and genuinely fillable."""
+    r = simulate_buy(book(asks=[(0.10, 5), (0.90, 10_000)]), 3.00, NO_FEE,
+                     max_fill_price=0.50)
+    assert r.filled
+    assert r.avg_price == pytest.approx(0.3857, abs=1e-4)
+
+
+def test_cap_rejection_still_reports_the_cheap_best_ask():
+    """The diagnostic must show both: the top of book looked fine, the average
+    did not. That contrast is the information."""
+    r = simulate_buy(book(asks=[(0.10, 2), (0.90, 10_000)]), 3.00, NO_FEE,
+                     max_fill_price=0.50)
+    assert r.best_price == pytest.approx(0.10)
+    assert r.worst_price == pytest.approx(0.90)
+    assert r.would_be_avg_price > r.best_price

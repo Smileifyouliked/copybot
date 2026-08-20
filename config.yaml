@@ -13,6 +13,7 @@ our_max_fill_price: 0.50       # our own fill must also be under this, or skip
 max_copies_per_token: 1        # don't stack $3 repeatedly into one market
 max_trade_age_seconds: 300     # don't copy stale trades after downtime
 poll_interval_seconds: 15
+activity_fetch_limit: 100     # rows per poll; he trades ~60/day so this is ample
 mirror_partial_sells: true
 
 # --- Fees -------------------------------------------------------------------
@@ -52,3 +53,23 @@ slippage_warn_pct: 15.0
 
 # Book realism
 respect_min_order_size: true   # honour the book's min_order_size on both sides
+
+# How far AFTER the decision moment a book may be stamped. Live fills legitimately
+# use a book fetched milliseconds after we decide -- that is the honest model, not
+# look-ahead. This bounds it so a book from minutes later can never be used.
+# Replay/backtest should pass 0, which requires the book to be provably earlier.
+max_book_lag_seconds: 5
+
+# --- Shadow size ladder -----------------------------------------------------
+# On every signal, the same fill is simulated at several sizes against the SAME
+# book snapshot. Costs no extra API calls and never touches the paper portfolio.
+# Produces a capacity curve: is $3 fine, is only $1 clean, or does nothing clear
+# at any size? The rung at his own size says whether his edge is real or an
+# artifact of being small enough not to move the book.
+shadow_ladder_usd: [1.00, 3.00, 10.00]
+shadow_ladder_include_his_sizes: true
+
+# CLV is also computed at fixed horizons after entry, not only at close. Fixed
+# horizons are always capturable because the book is still live, so a failed
+# closing-line capture no longer costs the whole measurement.
+clv_horizons_minutes: [15, 60, 360]

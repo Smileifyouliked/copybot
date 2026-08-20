@@ -11,7 +11,7 @@ from abc import ABC, abstractmethod
 
 from .config import LIVE_ENV_VARS, Config
 from .fees import FeeModel
-from .fills import simulate_buy, simulate_sell
+from .fills import LadderRung, simulate_buy, simulate_sell, size_ladder
 from .models import FillResult, OrderBook
 from .polymarket import PolymarketClient
 
@@ -31,6 +31,11 @@ class Executor(ABC):
     def sell(self, token_id: str, shares: float, *,
              book: OrderBook | None = None,
              decision_ts: int | None = None) -> FillResult: ...
+
+    @abstractmethod
+    def shadow_ladder(self, book: OrderBook, rungs: list[tuple[str, float]], *,
+                      decision_ts: int | None = None) -> list[LadderRung]:
+        """Measurement only: never moves cash, never opens a position."""
 
 
 class PaperExecutor(Executor):
@@ -72,6 +77,7 @@ class PaperExecutor(Executor):
             max_fill_price=self.cfg.our_max_fill_price,
             respect_min_order_size=self.cfg.respect_min_order_size,
             decision_ts=decision_ts,
+            max_book_lag_seconds=self.cfg.max_book_lag_seconds,
         )
 
     def sell(self, token_id: str, shares: float, *,
@@ -82,6 +88,17 @@ class PaperExecutor(Executor):
             book, shares, self._fee_for(book),
             respect_min_order_size=self.cfg.respect_min_order_size,
             decision_ts=decision_ts,
+            max_book_lag_seconds=self.cfg.max_book_lag_seconds,
+        )
+
+    def shadow_ladder(self, book: OrderBook, rungs: list[tuple[str, float]], *,
+                      decision_ts: int | None = None) -> list[LadderRung]:
+        return size_ladder(
+            book, rungs, self._fee_for(book),
+            max_fill_price=self.cfg.our_max_fill_price,
+            respect_min_order_size=self.cfg.respect_min_order_size,
+            decision_ts=decision_ts,
+            max_book_lag_seconds=self.cfg.max_book_lag_seconds,
         )
 
 
@@ -115,6 +132,10 @@ class LiveExecutor(Executor):
 
     def sell(self, token_id: str, shares: float, *, book: OrderBook | None = None,
              decision_ts: int | None = None) -> FillResult:  # pragma: no cover
+        raise NotImplementedError
+
+    def shadow_ladder(self, book: OrderBook, rungs, *,
+                      decision_ts: int | None = None):  # pragma: no cover
         raise NotImplementedError
 
 

@@ -108,3 +108,53 @@ def test_reconcile_batch_strict_raises_on_unrequested_ids():
     with pytest.raises(BatchMismatch):
         reconcile_batch(["a"], [{"id": "zzz"}], key_of=lambda x: x["id"],
                         what="test", strict=True)
+
+
+# --- 404 on a single book is a state, not an error -------------------------
+
+class _Resp:
+    def __init__(self, status, text="", payload=None):
+        self.status_code = status
+        self.text = text
+        self.headers: dict = {}
+        self._payload = payload or {}
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        pass
+
+
+def test_404_on_get_book_returns_an_empty_book(client, monkeypatch):
+    """CLOB /book 404s for a resolved token -- the single-fetch counterpart of
+    POST /books omitting it. Normal state, not an error."""
+    calls = []
+    monkeypatch.setattr(client._client, "request",
+                        lambda m, u, **k: (calls.append(u), _Resp(404, "not found"))[1])
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    book = client.get_book("TOK_RESOLVED")
+    assert book.is_empty
+    assert book.token_id == "TOK_RESOLVED"
+    assert len(calls) == 1, f"a permanent 404 was retried {len(calls)} times"
+
+
+def test_500_is_still_retried(client, monkeypatch):
+    calls = []
+    monkeypatch.setattr(client._client, "request",
+                        lambda m, u, **k: (calls.append(u), _Resp(503, "down"))[1])
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    with pytest.raises(Exception):
+        client.get_activity("0xabc")
+    assert len(calls) == client.max_retries
+
+
+def test_other_4xx_is_not_retried(client, monkeypatch):
+    calls = []
+    monkeypatch.setattr(client._client, "request",
+                        lambda m, u, **k: (calls.append(u), _Resp(400, "bad request"))[1])
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    with pytest.raises(Exception):
+        client.get_activity("0xabc")
+    assert len(calls) == 1

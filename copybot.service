@@ -1,0 +1,47 @@
+# Polymarket copy-trading paper bot.
+#
+#   sudo cp copybot.service /etc/systemd/system/copybot.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now copybot
+#
+# Adjust User= and the paths if you did not install to /home/ubuntu/copybot.
+
+[Unit]
+Description=Polymarket copy-trading paper bot
+Documentation=file:///home/ubuntu/copybot/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/copybot
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/home/ubuntu/copybot/src
+ExecStart=/home/ubuntu/copybot/.venv/bin/python -m copybot.main run -c /home/ubuntu/copybot/config.yaml
+
+Restart=always
+RestartSec=10
+
+# The bot writes its own rotating log file; keep the journal light.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=copybot
+
+# Modest footprint so this is comfortable on a t3.small.
+MemoryMax=400M
+CPUQuota=50%
+
+# Hardening: the bot only needs to read its own directory and talk to the network.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/copybot/data /home/ubuntu/copybot/logs
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

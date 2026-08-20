@@ -15,7 +15,10 @@ def build(db, cfg, books=None, metas=None, fee_rate=0.0, now=1_787_000_000):
     return Strategy(cfg, db, ex, cl, clock=lambda: now), ex, cl
 
 
-DEEP = {"TOK1": make_book(asks=[(0.20, 10_000)], bids=[(0.19, 10_000)])}
+def deep():
+    """Fresh dict per call -- a shared one lets a test that swaps in an empty
+    book poison every test after it."""
+    return {"TOK1": make_book(asks=[(0.20, 10_000)], bids=[(0.19, 10_000)])}
 
 
 # --- 7. The entry price filter --------------------------------------------
@@ -40,7 +43,7 @@ def test_buy_at_51c_is_not_copied(db, cfg):
 
 def test_buy_exactly_at_50c_is_not_copied(db, cfg):
     """max_entry_price is exclusive: 'under this'."""
-    s, _, _ = build(db, cfg, books=DEEP)
+    s, _, _ = build(db, cfg, books=deep())
     c = s.process_trades([make_trade(price=0.50, ts=1_787_000_000)])
     assert c.copied == 0
 
@@ -59,14 +62,14 @@ def test_our_fill_above_our_max_is_skipped_even_when_his_was_cheap(db, cfg):
 # --- Other buy-path gates --------------------------------------------------
 
 def test_stale_trade_is_skipped(db, cfg):
-    s, _, _ = build(db, cfg, books=DEEP, now=1_787_000_000)
+    s, _, _ = build(db, cfg, books=deep(), now=1_787_000_000)
     c = s.process_trades([make_trade(price=0.20, ts=1_787_000_000 - 600)])
     assert c.copied == 0
     assert db.recent_skips()[0]["reason"] == SkipReason.TRADE_TOO_OLD.value
 
 
 def test_second_copy_of_same_token_is_skipped(db, cfg):
-    s, _, _ = build(db, cfg, books=DEEP)
+    s, _, _ = build(db, cfg, books=deep())
     s.process_trades([make_trade(price=0.20, tx="0xa", ts=1_787_000_000)])
     c = s.process_trades([make_trade(price=0.20, tx="0xb", ts=1_787_000_001)])
     assert c.copied == 0
@@ -77,7 +80,7 @@ def test_second_copy_of_same_token_is_skipped(db, cfg):
 def test_out_of_cash_is_skipped_with_that_reason(db, cfg):
     small = tweak(cfg, starting_capital_usd=4.0)
     db.starting_capital_usd = 4.0
-    s, _, _ = build(db, small, books=DEEP)
+    s, _, _ = build(db, small, books=deep())
     s.process_trades([make_trade(token_id="TOK1", price=0.20, tx="0xa", ts=1_787_000_000)])
     s2, _, _ = build(db, small, books={"TOK9": make_book(token_id="TOK9", asks=[(0.20, 10_000)])})
     c = s2.process_trades([make_trade(token_id="TOK9", price=0.20, tx="0xb", ts=1_787_000_000)])
@@ -87,7 +90,7 @@ def test_out_of_cash_is_skipped_with_that_reason(db, cfg):
 
 def test_position_records_both_size_ratios_and_his_vwap(db, cfg):
     """He scaled in across three fills; we copy only the first."""
-    s, _, _ = build(db, cfg, books=DEEP)
+    s, _, _ = build(db, cfg, books=deep())
     s.process_trades([
         make_trade(price=0.10, shares=5.0, tx="0x1", ts=1_787_000_000),   # $0.50
         make_trade(price=0.02, shares=10.0, tx="0x2", ts=1_787_000_001),  # $0.20
@@ -203,7 +206,7 @@ def test_mirror_partial_sells_disabled_closes_everything(db, cfg):
 
 
 def test_his_sell_on_a_token_we_never_held_is_ignored(db, cfg):
-    s, _, _ = build(db, cfg, books=DEEP)
+    s, _, _ = build(db, cfg, books=deep())
     c = s.process_trades([make_trade(side="SELL", price=0.30, shares=10.0,
                                      tx="0x2", ts=1_787_000_010)])
     assert c.ignored == 1
@@ -225,7 +228,7 @@ def test_round_trip_reconciles(db, cfg):
 
 def test_winning_token_settles_at_one_dollar(db, cfg):
     metas = {"0xcond1": make_meta(prices=(0.30, 0.70))}
-    s, _, cl = build(db, cfg, books=DEEP, metas=metas)
+    s, _, cl = build(db, cfg, books=deep(), metas=metas)
     s.process_trades([make_trade(price=0.20, ts=1_787_000_000)])
     pos_id = db.open_positions()[0]["id"]
     shares = db.get_position(pos_id)["shares"]
@@ -244,7 +247,7 @@ def test_winning_token_settles_at_one_dollar(db, cfg):
 
 def test_losing_token_settles_at_zero(db, cfg):
     metas = {"0xcond1": make_meta(prices=(0.30, 0.70))}
-    s, _, cl = build(db, cfg, books=DEEP, metas=metas)
+    s, _, cl = build(db, cfg, books=deep(), metas=metas)
     s.process_trades([make_trade(price=0.20, ts=1_787_000_000)])
     pos_id = db.open_positions()[0]["id"]
 
@@ -262,7 +265,7 @@ def test_losing_token_settles_at_zero(db, cfg):
 
 def test_settlement_charges_no_fee(db, cfg):
     metas = {"0xcond1": make_meta(prices=(0.30, 0.70))}
-    s, _, cl = build(db, cfg, books=DEEP, metas=metas, fee_rate=0.05)
+    s, _, cl = build(db, cfg, books=deep(), metas=metas, fee_rate=0.05)
     s.process_trades([make_trade(price=0.20, ts=1_787_000_000)])
     cl.metas["0xcond1"] = make_meta(prices=(1.0, 0.0), closed=True)
     s.check_resolutions()
@@ -273,7 +276,7 @@ def test_settlement_charges_no_fee(db, cfg):
 def test_closed_but_ambiguous_price_does_not_settle(db, cfg):
     """A closed market showing 0.45 is not a resolution we understand."""
     metas = {"0xcond1": make_meta(prices=(0.30, 0.70))}
-    s, _, cl = build(db, cfg, books=DEEP, metas=metas)
+    s, _, cl = build(db, cfg, books=deep(), metas=metas)
     s.process_trades([make_trade(price=0.20, ts=1_787_000_000)])
     cl.metas["0xcond1"] = make_meta(prices=(0.45, 0.55), closed=True)
     assert s.check_resolutions() == 0
@@ -282,7 +285,7 @@ def test_closed_but_ambiguous_price_does_not_settle(db, cfg):
 
 def test_unresolved_market_is_left_alone(db, cfg):
     metas = {"0xcond1": make_meta(prices=(0.30, 0.70), closed=False)}
-    s, _, _ = build(db, cfg, books=DEEP, metas=metas)
+    s, _, _ = build(db, cfg, books=deep(), metas=metas)
     s.process_trades([make_trade(price=0.20, ts=1_787_000_000)])
     assert s.check_resolutions() == 0
     assert len(db.open_positions()) == 1

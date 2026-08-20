@@ -174,3 +174,88 @@ def fee_summary(db: Database) -> dict:
     return {"total_fees_usd": row["fees"], "gross_usd": gross,
             "fee_pct_of_gross": (row["fees"] / gross * 100) if gross else None,
             "fee_rate_fallbacks": row["fallbacks"] or 0, "n_trades": row["n"]}
+
+
+def clv_at_horizons(db: Database, horizons_minutes: list[int],
+                    tolerance_seconds: int = 600) -> list[dict]:
+    """CLV measured at fixed horizons after entry, not only at close.
+
+    A fixed horizon is always capturable because the book is still live at that
+    point, so a failed closing-line capture no longer costs the whole
+    measurement for that trade. It also distinguishes a price that drifts our
+    way at +1h but gives it back by close from one that never moves at all --
+    different information, and with this few winners every extra observation
+    per trade counts.
+
+    Only book-derived marks qualify (see `Database.mark_nearest`).
+    """
+    positions = db.conn.execute(
+        "SELECT id, opened_ts, our_avg_fill FROM positions WHERE our_avg_fill > 0"
+    ).fetchall()
+    out = []
+    for minutes in sorted(horizons_minutes):
+        target_offset = minutes * 60
+        values, matched = [], 0
+        for position in positions:
+            mark = db.mark_nearest(
+                position["id"], position["opened_ts"] + target_offset,
+                tolerance_seconds, book_only=True,
+            )
+            if mark is None or mark["mid"] is None:
+                continue
+            matched += 1
+            entry = position["our_avg_fill"]
+            values.append((mark["mid"] - entry) / entry * 100.0)
+        out.append({
+            "horizon_minutes": minutes,
+            "eligible": len(positions),
+            "measured": matched,
+            "coverage": (matched / len(positions)) if positions else None,
+            "mean_clv_pct": (sum(values) / len(values)) if values else None,
+            "median_clv_pct": (sorted(values)[len(values) // 2]) if values else None,
+            "positive": sum(1 for v in values if v > 0),
+        })
+    return out
+
+
+def depth_cost_summary(db: Database, stake_label: str = "$3") -> dict:
+    """Distribution of what our own order size does to the book.
+
+    Promoted to a first-class number rather than a footnote: if a $3 order
+    routinely moves these books, size is what kills this strategy, not
+    stock-picking, and that verdict should arrive in week two.
+    """
+    costs = db.depth_cost_distribution(stake_label)
+    if not costs:
+        return {"n": 0, "median": None, "mean": None, "p90": None,
+                "free": 0, "over_15pct": 0, "buckets": []}
+    n = len(costs)
+
+    def pct(fraction: float) -> float:
+        return costs[min(n - 1, int(n * fraction))]
+
+    edges = [(0, 1, "no cost"), (1, 5, "under 5%"), (5, 15, "5-15%"),
+             (15, 50, "15-50%"), (50, float("inf"), "over 50%")]
+    buckets = [{"label": label,
+                "n": sum(1 for c in costs if lo <= c < hi)}
+               for lo, hi, label in edges]
+    return {
+        "n": n,
+        "median": costs[n // 2],
+        "mean": sum(costs) / n,
+        "p90": pct(0.9),
+        "free": sum(1 for c in costs if c < 1),
+        "over_15pct": sum(1 for c in costs if c > 15),
+        "buckets": buckets,
+    }
+
+
+def capacity_curve(db: Database) -> list[dict]:
+    """The shadow ladder rolled up: what fraction of signals clear at each size.
+
+    Three readings, all actionable:
+      * every rung clears cheaply      -> size is not the constraint
+      * $1 clears but $3 does not      -> the edge is real but small-only
+      * nothing clears at any size     -> stop now, not in month three
+    """
+    return db.shadow_ladder_summary()

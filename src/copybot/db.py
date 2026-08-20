@@ -159,6 +159,56 @@ CREATE TABLE IF NOT EXISTS skipped_trades (
 CREATE INDEX IF NOT EXISTS idx_skip_ts ON skipped_trades(seen_ts DESC);
 CREATE INDEX IF NOT EXISTS idx_skip_reason ON skipped_trades(reason);
 
+-- Every size simulated against a signal's book snapshot, fills and skips alike.
+-- Nothing here touches cash or positions; it is a capacity curve, collected for
+-- free because it reuses the snapshot the real decision already fetched.
+CREATE TABLE IF NOT EXISTS shadow_fills (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_key         TEXT,
+    token_id          TEXT NOT NULL,
+    condition_id      TEXT,
+    question          TEXT,
+    seen_ts           INTEGER NOT NULL,
+    his_price         REAL,
+    his_ts            INTEGER,
+    his_usd_size      REAL,
+    book_timestamp_ms INTEGER,
+    book_best_ask     REAL,
+    book_ask_levels   INTEGER,
+    outcome           TEXT,             -- what the real decision did
+    rung_label        TEXT NOT NULL,    -- '$1' | '$3' | '$10' | 'his_fill' | 'his_position'
+    rung_usd          REAL NOT NULL,
+    filled            INTEGER NOT NULL,
+    shares            REAL,
+    vwap              REAL,
+    depth_cost_pct    REAL,
+    levels_consumed   INTEGER,
+    cleared_max_fill  INTEGER,
+    below_min_order_size INTEGER,
+    fee_usd           REAL,
+    skip_reason       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_shadow_ts ON shadow_fills(seen_ts DESC);
+CREATE INDEX IF NOT EXISTS idx_shadow_rung ON shadow_fills(rung_label);
+CREATE INDEX IF NOT EXISTS idx_shadow_trade ON shadow_fills(trade_key);
+
+-- Every mark, kept as its own row rather than overwriting one field. A single
+-- overwritten mark makes CLV all-or-nothing on one capture landing in the window
+-- before the book empties; a full path gives CLV at fixed horizons too, which
+-- are always capturable because the book is still live at those points.
+CREATE TABLE IF NOT EXISTS marks (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    position_id INTEGER NOT NULL REFERENCES positions(id),
+    token_id    TEXT NOT NULL,
+    ts          INTEGER NOT NULL,
+    bid         REAL,
+    ask         REAL,
+    mid         REAL,
+    spread      REAL,
+    source      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_marks_pos ON marks(position_id, ts);
+
 CREATE TABLE IF NOT EXISTS equity_snapshots (
     ts                  INTEGER PRIMARY KEY,
     cash_usd            REAL NOT NULL,
@@ -439,6 +489,109 @@ class Database:
     def skip_counts(self) -> dict[str, int]:
         return {r["reason"]: r["n"] for r in
                 self._all("SELECT reason, COUNT(*) AS n FROM skipped_trades GROUP BY reason")}
+
+    # -- shadow ladder -----------------------------------------------------
+    def record_shadow_ladder(self, conn, rungs, *, trade=None, book=None,
+                             question: str = "", outcome: str = "",
+                             his_usd_size: float | None = None) -> None:
+        for rung in rungs:
+            conn.execute(
+                """INSERT INTO shadow_fills
+                   (trade_key, token_id, condition_id, question, seen_ts,
+                    his_price, his_ts, his_usd_size, book_timestamp_ms,
+                    book_best_ask, book_ask_levels, outcome, rung_label, rung_usd,
+                    filled, shares, vwap, depth_cost_pct, levels_consumed,
+                    cleared_max_fill, below_min_order_size, fee_usd, skip_reason)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    getattr(trade, "trade_key", None),
+                    getattr(trade, "token_id", None) or (book.token_id if book else ""),
+                    getattr(trade, "condition_id", None),
+                    question, now_ts(),
+                    getattr(trade, "price", None),
+                    getattr(trade, "traded_ts", None),
+                    his_usd_size,
+                    book.timestamp_ms if book else None,
+                    book.best_ask if book else None,
+                    len(book.asks) if book else None,
+                    outcome, rung.label, rung.usd,
+                    1 if rung.filled else 0, rung.shares, rung.vwap,
+                    rung.depth_cost_pct, rung.levels_consumed,
+                    1 if rung.cleared_max_fill else 0,
+                    1 if rung.below_min_order_size else 0,
+                    rung.fee_usd, rung.skip_reason,
+                ),
+            )
+
+    def shadow_ladder_summary(self) -> list[dict]:
+        """Median depth cost and clear rate per rung -- the capacity curve."""
+        labels = [r["rung_label"] for r in self._all(
+            "SELECT DISTINCT rung_label FROM shadow_fills")]
+        out = []
+        for label in labels:
+            rows = self._all(
+                """SELECT depth_cost_pct, filled, cleared_max_fill, rung_usd,
+                          levels_consumed
+                   FROM shadow_fills WHERE rung_label = ?""", (label,))
+            n = len(rows)
+            if not n:
+                continue
+            # Signals where the book was empty carry no depth information at
+            # all. Averaging them in as zero would understate the real cost, so
+            # measurable rows are counted and averaged separately from all rows.
+            measurable = [r for r in rows if r["depth_cost_pct"] is not None]
+            costs = sorted(r["depth_cost_pct"] for r in measurable)
+            filled = [r for r in rows if r["filled"]]
+            out.append({
+                "rung": label,
+                "n": n,
+                "measured": len(measurable),
+                # his_fill / his_position vary per signal, so the representative
+                # size is the average rather than whichever row came back first.
+                "usd": sum(r["rung_usd"] for r in rows) / n,
+                "median_depth_cost_pct": costs[len(costs) // 2] if costs else None,
+                "p90_depth_cost_pct": costs[min(len(costs) - 1, int(len(costs) * 0.9))]
+                                      if costs else None,
+                "fill_rate": len(filled) / n,
+                "clear_rate": sum(r["cleared_max_fill"] for r in rows) / n,
+                # Levels are only meaningful where a fill actually happened.
+                "mean_levels": (sum(r["levels_consumed"] or 0 for r in filled) / len(filled))
+                               if filled else None,
+            })
+        return sorted(out, key=lambda r: r["usd"])
+
+    def depth_cost_distribution(self, rung_label: str = "$3") -> list[float]:
+        return [r["depth_cost_pct"] for r in self._all(
+            "SELECT depth_cost_pct FROM shadow_fills WHERE rung_label = ? "
+            "AND depth_cost_pct IS NOT NULL ORDER BY depth_cost_pct", (rung_label,))]
+
+    # -- marks -------------------------------------------------------------
+    def record_mark(self, conn, position_id: int, token_id: str, ts: int,
+                    bid, ask, mid, spread, source: str) -> None:
+        conn.execute(
+            """INSERT INTO marks (position_id, token_id, ts, bid, ask, mid, spread, source)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (position_id, token_id, ts, bid, ask, mid, spread, source),
+        )
+
+    def marks_for(self, position_id: int) -> list[sqlite3.Row]:
+        return self._all(
+            "SELECT * FROM marks WHERE position_id = ? ORDER BY ts ASC", (position_id,))
+
+    def mark_nearest(self, position_id: int, target_ts: int,
+                     tolerance_seconds: int, book_only: bool = True):
+        """The mark closest to `target_ts` within tolerance.
+
+        Book-derived only by default: a gamma fallback price for a resolved
+        market is the outcome, not a market price, and would turn a horizon CLV
+        into a restatement of the result.
+        """
+        sql = ("SELECT *, ABS(ts - ?) AS distance FROM marks "
+               "WHERE position_id = ? AND ABS(ts - ?) <= ?")
+        params = [target_ts, position_id, target_ts, tolerance_seconds]
+        if book_only:
+            sql += " AND source IN ('book_mid','book_bid')"
+        return self._one(sql + " ORDER BY distance ASC LIMIT 1", params)
 
     # -- heartbeat / equity ------------------------------------------------
     def write_heartbeat(self, ok: bool, *, trades_seen: int = 0, copies_made: int = 0,

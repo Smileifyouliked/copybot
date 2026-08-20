@@ -1,0 +1,35 @@
+# Dashboard for the copy-trading bot. Binds 127.0.0.1 only -- there is no
+# authentication, so reach it over an SSH tunnel (see README). Do NOT open the
+# port in the EC2 security group.
+#
+#   sudo cp copybot-dashboard.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now copybot-dashboard
+
+[Unit]
+Description=Polymarket copybot dashboard (localhost only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/copybot
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/home/ubuntu/copybot/src
+ExecStart=/home/ubuntu/copybot/.venv/bin/python -m copybot.main dashboard -c /home/ubuntu/copybot/config.yaml
+
+Restart=always
+RestartSec=10
+SyslogIdentifier=copybot-dashboard
+
+MemoryMax=250M
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/copybot/data /home/ubuntu/copybot/logs
+
+[Install]
+WantedBy=multi-user.target
