@@ -1,0 +1,45 @@
+# ---------------------------------------------------------------------------
+# Polymarket copy-trading paper bot.
+# Everything tunable lives here. No magic numbers in code.
+# ---------------------------------------------------------------------------
+
+target_wallet: "0x6297b93ea37ff92a57fd636410f3b71ebf74517e"
+
+starting_capital_usd: 150.00
+stake_per_copy_usd: 3.00
+
+max_entry_price: 0.50          # only copy his buys below this
+our_max_fill_price: 0.50       # our own fill must also be under this, or skip
+max_copies_per_token: 1        # don't stack $3 repeatedly into one market
+max_trade_age_seconds: 300     # don't copy stale trades after downtime
+poll_interval_seconds: 15
+mirror_partial_sells: true
+
+# --- Fees -------------------------------------------------------------------
+# Polymarket's real taker fee is  shares * rate * p * (1 - p)  -- it is NOT a
+# flat bps of notional. The per-market `rate` is read live from gamma's
+# feeSchedule and cached. fee_rate_fallback is used only when that lookup
+# fails, and is logged at WARN every time it is used.
+# It must be > 0: a missing fee field silently becoming free trading is
+# exactly the bug class that makes paper look better than live.
+fee_rate_fallback: 0.05
+fee_bps_override: null         # set to a number to force flat bps (testing only)
+
+mode: "paper"                  # "paper" | "live" -- live must refuse to run
+dashboard_port: 8080
+dashboard_host: "127.0.0.1"    # no auth on the dashboard: localhost only
+
+db_path: "data/copybot.sqlite3"
+log_path: "logs/copybot.log"
+log_max_bytes: 10485760
+log_backup_count: 5
+
+resolution_check_interval_seconds: 300
+equity_snapshot_interval_seconds: 300
+
+# Entry is "worse than his" by this % -> dashboard warning banner.
+# Paper mode warns only. Live mode should HALT here (see NOTES.md).
+slippage_warn_pct: 15.0
+
+# Book realism
+respect_min_order_size: true   # honour the book's min_order_size on both sides
