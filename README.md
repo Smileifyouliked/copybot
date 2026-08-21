@@ -102,6 +102,18 @@ PYTHONPATH=src .venv/bin/python -m copybot.main dashboard    # the dashboard
 
 ---
 
+## Reading it without a browser
+
+If you only work on the server itself — through the AWS browser console, say —
+the SSH tunnel below is not available to you, since it needs an SSH client and
+the key file on your own machine. Same numbers, straight into the terminal:
+
+```bash
+cd ~/copybot && PYTHONPATH=src .venv/bin/python -m copybot.main report
+```
+
+Everything the web dashboard shows, in the same order, as text.
+
 ## Viewing the dashboard
 
 The dashboard has **no login**, so it binds `127.0.0.1` only. `config.py`

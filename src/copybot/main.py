@@ -2,7 +2,8 @@
 
     python -m copybot.main run          # the polling loop
     python -m copybot.main dashboard    # the web dashboard
-    python -m copybot.main status       # one-shot state dump, no server
+    python -m copybot.main report       # the dashboard as text, no browser
+    python -m copybot.main status       # one-line state dump
 """
 from __future__ import annotations
 
@@ -14,7 +15,8 @@ from .config import ConfigError, load_config
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="copybot")
-    parser.add_argument("command", choices=["run", "dashboard", "status"])
+    parser.add_argument("command",
+                        choices=["run", "dashboard", "report", "status"])
     parser.add_argument("-c", "--config", default="config.yaml")
     args = parser.parse_args(argv)
 
@@ -42,6 +44,15 @@ def main(argv: list[str] | None = None) -> int:
 
     from .db import Database
     db = Database(cfg.db_path, cfg.starting_capital_usd)
+
+    if args.command == "report":
+        from .textreport import render
+        try:
+            print(render(cfg, db))
+            return 0
+        finally:
+            db.close()
+
     try:
         value = sum(
             r["shares"] * (r["last_mark_price"] if r["last_mark_price"] is not None
