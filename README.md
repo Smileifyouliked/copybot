@@ -112,7 +112,14 @@ the key file on your own machine. Same numbers, straight into the terminal:
 cd ~/copybot && PYTHONPATH=src .venv/bin/python -m copybot.main report
 ```
 
-Everything the web dashboard shows, in the same order, as text.
+Everything the web dashboard shows, in the same order, as text. Add `--watch`
+to have it redraw in place like `top`:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m copybot.main report --watch
+```
+
+`Ctrl-C` stops watching; it does not touch the bot.
 
 ## Viewing the dashboard
 

@@ -3,6 +3,7 @@
     python -m copybot.main run          # the polling loop
     python -m copybot.main dashboard    # the web dashboard
     python -m copybot.main report       # the dashboard as text, no browser
+    python -m copybot.main report --watch   # ...refreshing, like top
     python -m copybot.main status       # one-line state dump
 """
 from __future__ import annotations
@@ -18,6 +19,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("command",
                         choices=["run", "dashboard", "report", "status"])
     parser.add_argument("-c", "--config", default="config.yaml")
+    parser.add_argument("--watch", action="store_true",
+                        help="report only: redraw every --interval seconds")
+    parser.add_argument("--interval", type=int, default=10,
+                        help="seconds between redraws when --watch is set")
     args = parser.parse_args(argv)
 
     try:
@@ -48,8 +53,26 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "report":
         from .textreport import render
         try:
-            print(render(cfg, db))
-            return 0
+            if not args.watch:
+                print(render(cfg, db))
+                return 0
+            import time as _time
+            try:
+                while True:
+                    # Reopen so the reader always sees the writer's latest
+                    # committed state rather than a stale snapshot.
+                    fresh = Database(cfg.db_path, cfg.starting_capital_usd)
+                    try:
+                        body = render(cfg, fresh)
+                    finally:
+                        fresh.close()
+                    print("\033[H\033[J" + body +
+                          f"  refreshing every {args.interval}s — Ctrl-C to stop",
+                          flush=True)
+                    _time.sleep(args.interval)
+            except KeyboardInterrupt:
+                print()
+                return 0
         finally:
             db.close()
 
