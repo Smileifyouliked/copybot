@@ -228,15 +228,25 @@ class PolymarketClient:
 
         for i in range(0, len(missing), GAMMA_CHUNK):
             chunk = missing[i:i + GAMMA_CHUNK]
-            params = [("condition_ids", c) for c in chunk]
-            try:
-                data = self._request("GET", f"{GAMMA_API}/markets", params=params)
-            except PolymarketError as exc:
-                log.warning("gamma /markets failed for %d ids: %s", len(chunk), exc)
-                continue
+            base = [("condition_ids", c) for c in chunk]
+            # gamma filters by resolution state and defaults to OPEN ONLY: a
+            # request with no `closed` param silently omits every resolved
+            # market. Asking once therefore makes resolutions invisible, and
+            # nothing ever settles. Both states have to be asked for
+            # explicitly and merged.
+            rows: list = []
+            for extra in ({}, {"closed": "true"}):
+                params = base + list(extra.items())
+                try:
+                    data = self._request("GET", f"{GAMMA_API}/markets", params=params)
+                except PolymarketError as exc:
+                    log.warning("gamma /markets failed for %d ids (%s): %s",
+                                len(chunk), extra or "open", exc)
+                    continue
+                if isinstance(data, list):
+                    rows.extend(data)
             metas = [
-                m for m in (self._parse_market(r) for r in
-                            (data if isinstance(data, list) else []))
+                m for m in (self._parse_market(r) for r in rows)
                 if m is not None
             ]
             # gamma silently drops unknown condition_ids: ask for 2, get 1, 200 OK.

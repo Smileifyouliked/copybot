@@ -158,3 +158,44 @@ def test_other_4xx_is_not_retried(client, monkeypatch):
     with pytest.raises(Exception):
         client.get_activity("0xabc")
     assert len(calls) == 1
+
+
+# --- gamma hides resolved markets unless asked ----------------------------
+
+def test_get_markets_asks_for_closed_markets_too(client, monkeypatch):
+    """gamma defaults to open-only. Asking once makes every resolution
+    invisible, so nothing ever settles and positions accumulate forever."""
+    calls = []
+
+    def fake(method, url, **kwargs):
+        params = dict(kwargs.get("params") or [])
+        calls.append(params.get("closed"))
+        if params.get("closed") == "true":
+            return [{"conditionId": "0xclosed", "question": "done",
+                     "clobTokenIds": '["T1","T2"]', "outcomes": '["Yes","No"]',
+                     "outcomePrices": '["1","0"]', "closed": True,
+                     "acceptingOrders": False, "feesEnabled": False}]
+        return [{"conditionId": "0xopen", "question": "live",
+                 "clobTokenIds": '["T3","T4"]', "outcomes": '["Yes","No"]',
+                 "outcomePrices": '["0.4","0.6"]', "closed": False,
+                 "acceptingOrders": True, "feesEnabled": False}]
+
+    monkeypatch.setattr(client, "_request", fake)
+    metas = client.get_markets(["0xopen", "0xclosed"])
+
+    assert None in calls and "true" in calls, "both resolution states must be requested"
+    assert set(metas) == {"0xopen", "0xclosed"}
+    assert metas["0xclosed"].closed is True
+    assert metas["0xclosed"].settlement_value("T1") == 1.0
+    assert metas["0xopen"].closed is False
+
+
+def test_resolved_market_is_settleable_after_the_fix(client, monkeypatch):
+    monkeypatch.setattr(client, "_request", lambda m, u, **k: (
+        [{"conditionId": "0xc", "question": "q", "clobTokenIds": '["WIN","LOSE"]',
+          "outcomes": '["Yes","No"]', "outcomePrices": '["1","0"]', "closed": True,
+          "acceptingOrders": False, "feesEnabled": False}]
+        if dict(k.get("params") or []).get("closed") == "true" else []))
+    meta = client.get_markets(["0xc"])["0xc"]
+    assert meta.settlement_value("WIN") == 1.0
+    assert meta.settlement_value("LOSE") == 0.0
