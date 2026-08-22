@@ -232,3 +232,52 @@ def test_go_live_gate_is_not_green_before_anything_is_measured(db, cfg):
     assert rules["go_live"]["kills_clear"] is False
     assert rules["go_live"]["still_collecting"] == len(rules["kill"])
     assert rules["go_live"]["ready"] is False
+
+
+# --- the fee-fallback warning must stay meaningful -------------------------
+
+def test_empty_book_does_not_trip_the_fee_fallback_warning(cfg, caplog):
+    """Every resolved market returns an empty book. Warning on each one buries
+    the real fallbacks this warning exists to surface -- 103 false positives in
+    one short run, before this was fixed."""
+    import logging
+
+    from copybot.executor import PaperExecutor
+
+    class Client:
+        def get_book(self, token_id):
+            return OrderBook(token_id=token_id, bids=[], asks=[],
+                             tick_size=0.001, min_order_size=5.0)
+
+        def fee_rate_for(self, condition_id, fallback):
+            raise AssertionError("must not look up a fee for an empty book")
+
+    ex = PaperExecutor(cfg, Client())
+    with caplog.at_level(logging.WARNING):
+        result = ex.buy("TOK", 3.00)
+    assert not result.filled
+    assert "FEE FALLBACK" not in caplog.text
+
+
+def test_real_missing_condition_id_still_warns(cfg, caplog):
+    """A book with depth but no conditionId is a genuine problem and must
+    still be loud."""
+    import logging
+
+    from copybot.executor import PaperExecutor
+
+    class Client:
+        def get_book(self, token_id):
+            return OrderBook(token_id=token_id, condition_id="",
+                             bids=[BookLevel(0.19, 500)], asks=[BookLevel(0.20, 500)],
+                             tick_size=0.001, min_order_size=5.0)
+
+        def fee_rate_for(self, condition_id, fallback):
+            return fallback, True
+
+    ex = PaperExecutor(cfg, Client())
+    with caplog.at_level(logging.WARNING):
+        result = ex.buy("TOK", 3.00)
+    assert result.filled
+    assert "FEE FALLBACK" in caplog.text
+    assert result.fee_rate_was_fallback

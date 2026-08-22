@@ -56,6 +56,14 @@ class PaperExecutor(Executor):
     def _fee_for(self, book: OrderBook) -> FeeModel:
         """The book carries its own conditionId, so fee resolution needs no
         extra plumbing from the caller."""
+        if book.is_empty:
+            # No fill can happen against an empty book, so this rate is never
+            # used. Resolving it anyway would emit a fee-fallback warning for
+            # every resolved market the wallet ever touched -- and that warning
+            # exists to make a REAL missing fee rate impossible to miss. Drowning
+            # it in hundreds of false positives defeats the guardrail.
+            return FeeModel(rate=self.cfg.fee_rate_fallback, was_fallback=False,
+                            bps_override=self.cfg.fee_bps_override)
         if not book.condition_id:
             log.warning("FEE FALLBACK: book for %s carries no conditionId -- "
                         "using fallback rate %.4f", book.token_id[:16],

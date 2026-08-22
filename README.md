@@ -121,6 +121,23 @@ PYTHONPATH=src .venv/bin/python -m copybot.main report --watch
 
 `Ctrl-C` stops watching; it does not touch the bot.
 
+## Sending it to someone (or an AI) for analysis
+
+```bash
+cd ~/copybot && PYTHONPATH=src .venv/bin/python -m copybot.main export
+```
+
+Prints a single self-contained bundle and saves it to `analysis-bundle.md`.
+Roughly 20 KB — small enough to paste into a chat.
+
+Do **not** send the raw log. It is mostly repeated `SKIP` lines, grows to
+megabytes, and the numbers that matter are aggregates the log never states.
+The bundle contains the config in force, the full dashboard view, every
+aggregate (capacity ladder, depth cost distribution, entry bands, exit paths,
+CLV by horizon, fees, slippage, every skip reason), per-position and
+per-execution tables, and from the log only what carries signal: level counts,
+warnings and errors with repeats collapsed, and the last few lines.
+
 ## Viewing the dashboard
 
 The dashboard has **no login**, so it binds `127.0.0.1` only. `config.py`

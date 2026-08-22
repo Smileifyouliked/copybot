@@ -4,12 +4,14 @@
     python -m copybot.main dashboard    # the web dashboard
     python -m copybot.main report       # the dashboard as text, no browser
     python -m copybot.main report --watch   # ...refreshing, like top
+    python -m copybot.main export       # one bundle to hand an analyst
     python -m copybot.main status       # one-line state dump
 """
 from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 
 from .config import ConfigError, load_config
 
@@ -17,7 +19,7 @@ from .config import ConfigError, load_config
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="copybot")
     parser.add_argument("command",
-                        choices=["run", "dashboard", "report", "status"])
+                        choices=["run", "dashboard", "report", "export", "status"])
     parser.add_argument("-c", "--config", default="config.yaml")
     parser.add_argument("--watch", action="store_true",
                         help="report only: redraw every --interval seconds")
@@ -49,6 +51,18 @@ def main(argv: list[str] | None = None) -> int:
 
     from .db import Database
     db = Database(cfg.db_path, cfg.starting_capital_usd)
+
+    if args.command == "export":
+        from .exportbundle import build
+        try:
+            text = build(cfg, db)
+            out = Path("analysis-bundle.md")
+            out.write_text(text)
+            print(text)
+            print(f"\n[saved to {out.resolve()}]", file=sys.stderr)
+            return 0
+        finally:
+            db.close()
 
     if args.command == "report":
         from .textreport import render
