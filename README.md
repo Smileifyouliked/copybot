@@ -33,14 +33,19 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 
 mkdir -p data logs
-.venv/bin/python -m pytest tests/ -q          # 115 tests, all should pass
+.venv/bin/python -m pytest tests/ -q          # all should pass, none skipped
 ```
 
 Sanity-check the config and the API before running for real:
 
 ```bash
 PYTHONPATH=src .venv/bin/python -m copybot.main status
+grep '^entry_mode' config.yaml               # should say "limit"
 ```
+
+On a fresh install `status` reports $150.00 cash, no open positions and
+`last heartbeat: never`. That is correct: the database is created empty on
+first use and the starting capital is a config number, not a deposit.
 
 ### Run it under systemd
 
@@ -108,7 +113,22 @@ Run 1 (market orders) is the only baseline run 2 (limit orders) can be judged
 against, so **nothing here deletes it.** `archive` copies; moving the live file
 aside is a `mv`, never an `rm`.
 
-Copy-paste this whole block on the server, in this order:
+**First check there is anything to preserve.** If the previous install was
+removed, there is no run 1 to archive and this whole section is skippable —
+go to [Install on Ubuntu (EC2)](#install-on-ubuntu-ec2) instead:
+
+```bash
+sudo find / -name "copybot*.sqlite3*" -not -path "*/proc/*" 2>/dev/null
+```
+
+Nothing printed means run 1 is gone. That costs the market-vs-limit
+comparison, and nothing else: the 1.395 break-even comes from the wallet's own
+public history, not from our database, so the kill condition still works on run
+2's own numbers. The absolute question — *is our entry price under 1.395x
+his* — never needed run 1 to answer.
+
+If it did print a database, copy-paste this whole block on the server, in this
+order:
 
 ```bash
 cd ~/copybot
