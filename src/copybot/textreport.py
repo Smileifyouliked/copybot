@@ -216,12 +216,21 @@ def render(cfg: Config, db: Database) -> str:
         for p in sorted(positions, key=lambda r: r["opened_ts"], reverse=True):
             mark = p["last_mark_price"] if p["last_mark_price"] is not None else p["our_avg_fill"]
             worth = p["shares"] * mark
-            change = worth - p["cost_basis_usd"]
+            # paid = what went in (cost_basis_opened, which only grows).
+            # cost_basis_usd is the basis of the shares still held, so a
+            # mirrored sell shrinks it -- printing that as "paid" made a $3.00
+            # position read as "paid $0.63" once he sold most of it back out.
+            still_held = p["cost_basis_usd"]
+            paid = p["cost_basis_opened"] or still_held
+            part_sold = p["shares_opened"] and p["shares"] < p["shares_opened"] - 1e-9
+            change = worth - still_held
             sign = "+" if change >= 0 else "-"
             out.append(f"  {(p['question'] or p['token_id'])[:66]}")
-            out.append(f"    paid {money(p['cost_basis_usd'])} · now {money(worth)} · "
+            out.append(f"    paid {money(paid)} · now {money(worth)} · "
                        f"{sign}{money(abs(change))} · bought {cents(p['our_avg_fill'])} "
-                       f"now {cents(mark)} · held {held_for(now - p['opened_ts'])}")
+                       f"now {cents(mark)} · held {held_for(now - p['opened_ts'])}"
+                       + (f" · part already sold, {money(still_held)} still in"
+                          if part_sold else ""))
     out.append("")
 
     # ---- feed ------------------------------------------------------------

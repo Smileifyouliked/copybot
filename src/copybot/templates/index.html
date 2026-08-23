@@ -419,8 +419,9 @@
       {% for h in holdings %}
       <tr>
         <td>{{ h.question }}
-            <div class="muted small">betting "{{ h.outcome }}" · bought at {{ h.bought_at }} · now {{ h.now_at }}</div></td>
-        <td class="num">{{ money(h.paid) }}</td>
+            <div class="muted small">betting "{{ h.outcome }}" · bought at {{ h.bought_at }} · now {{ h.now_at }}{% if h.part_sold %} · <strong>part already sold</strong>{% endif %}</div></td>
+        <td class="num">{{ money(h.paid) }}{% if h.part_sold %}
+            <div class="muted small">{{ money(h.still_held) }} still in</div>{% endif %}</td>
         <td class="num">{{ money(h.worth) }}</td>
         <td class="num {{ 'up' if h.change >= 0 else 'down' }}">
           {{ '+' if h.change >= 0 else '−' }}{{ money(h.change|abs) }}</td>

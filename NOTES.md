@@ -824,6 +824,59 @@ window is not a property to leave to luck. `flock` rather than a PID file
 because the kernel releases it however the process dies, so a stale file can
 never lock the bot out.
 
+## 11g. The $0.63 and $1.48 positions — resolved, and it was a label
+
+Two run-1 positions displayed `paid $0.63` and `paid $1.48` on a $3.00 budget.
+Both the "concurrent writers corrupted it" theory and the "fill simulator
+under-filled" theory were wrong. **The column was mislabelled.**
+
+* `cost_basis_opened` is what we put in. It only ever grows.
+* `cost_basis_usd` is the basis of the shares **still held**. A mirrored sell
+  releases the sold share of it (`strategy.py`, sell path).
+* The dashboard and the text report both printed `cost_basis_usd` under the
+  heading "you paid".
+
+So a position we funded with $3.00 and then mirrored an 80% sell out of
+correctly held $0.60 of basis, and correctly displayed it as "paid $0.60".
+Reproduced exactly in a test: fund a token to $3.00, mirror a sell of 80%,
+read `paid 0.60` / `cost_basis_opened 3.00`.
+
+Fixed: "paid" now reads `cost_basis_opened`, and a partly-sold position says so
+and shows what is still in. Up/down stays measured against the shares still
+held, because the money from the sold shares is already realised and already
+counted in cash — charging it against the position again would double-count it.
+
+The lesson worth keeping: **an anomalous number is a claim about a field, and
+the field has to be checked before the mechanism is theorised about.** Two
+plausible mechanisms were proposed for this before anyone read what the column
+contained, and both were wrong.
+
+## 11h. `doctor`: proving whether two bots ever wrote a database
+
+A manually started process once ran alongside the systemd unit. The question
+"did that damage the data" cannot be answered from the code, and memory of what
+was running is not evidence. The heartbeat table settles it retrospectively:
+
+**One process polling every N seconds cannot write more than 3600/N heartbeats
+in an hour.** That is a hard ceiling, not a heuristic. An hour above it is proof
+that something else wrote the same file. Backoff during API trouble only lowers
+the rate, so the test under-reports and can never invent a second writer.
+
+`doctor` reports the windows that exceed the ceiling with real timestamps, and
+then checks what a race could actually have damaged:
+
+* **Not torn rows.** SQLite serialises writes, so every execution row is one
+  process's complete result. Concurrency cannot make a row smaller — which is
+  why it was never a candidate explanation for S11g.
+* **Over-spent tokens.** Both processes read "spent so far", both see room,
+  both buy. The ledger still reconciles, so only a per-token cap check finds it.
+* **Duplicate open positions** on one token, which tranche-merging forbids.
+
+The verdict separates two things that a blanket pass/fail would blur: aggregate
+**rates** (fills per day, capital deployed) span both processes and cannot be
+read as one bot's behaviour, while **per-fill entry quality** is each fill's own
+number against a real book and survives.
+
 ## 12. Still open
 
 - Whether a disputed UMA resolution can reverse a settlement we already booked.
@@ -842,8 +895,5 @@ never lock the bot out.
   number is trustworthy on its own.
 - Whether back-of-queue is pessimistic enough. We never see our own order in a
   real queue, so the assumption cannot be validated from paper trading alone.
-- Two positions in the run-1 database show $0.63 and $1.48 paid rather than
-  $3.00. Not yet explained. Most likely the book ran out of asks inside our
-  price cap and the walk filled what it could, but it has not been traced back
-  to those specific rows, and it should be before run 1's numbers are used as
-  the baseline.
+- Whether run 1's own database shows a second writer. `doctor` answers it from
+  the heartbeat rate (S11g); it has not been run against the deployed file yet.

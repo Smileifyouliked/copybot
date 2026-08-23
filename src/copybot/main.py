@@ -7,6 +7,7 @@
     python -m copybot.main export       # one bundle to hand an analyst
     python -m copybot.main side-check   # settle the tape's `side` convention
     python -m copybot.main status       # one-line state dump
+    python -m copybot.main doctor       # was this file ever written by two bots?
     python -m copybot.main archive      # copy this run's database aside
     python -m copybot.main compare a.sqlite3 b.sqlite3   # entry quality, run vs run
 """
@@ -23,7 +24,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="copybot")
     parser.add_argument("command",
                         choices=["run", "dashboard", "report", "export", "side-check",
-                                 "status", "archive", "compare"])
+                                 "status", "archive", "compare", "doctor"])
     parser.add_argument("paths", nargs="*",
                         help="compare only: the run databases to compare")
     parser.add_argument("-c", "--config", default="config.yaml")
@@ -86,6 +87,15 @@ def main(argv: list[str] | None = None) -> int:
 
     from .db import Database
     db = Database(cfg.db_path, cfg.starting_capital_usd)
+
+    if args.command == "doctor":
+        from .doctor import diagnose, render
+        try:
+            report = diagnose(db, cfg)
+            print(render(report))
+            return 0 if not report.had_two_writers else 1
+        finally:
+            db.close()
 
     if args.command == "side-check":
         from .polymarket import PolymarketClient
