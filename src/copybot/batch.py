@@ -90,5 +90,24 @@ def reconcile_batch(
     return by_id, missing, unexpected
 
 
+def assert_complete_page(rows: Sequence, limit: int, *, what: str) -> bool:
+    """Warn when a paged response came back exactly full.
+
+    The set-reconciliation rule above covers calls that name what they want.
+    A paged call names only a count, so its silent-omission failure mode is
+    different: a full page means the server had at least as many rows as we
+    asked for, and anything beyond the limit was dropped without a signal.
+
+    Returns True when the page is full (i.e. possibly truncated).
+    """
+    if limit and len(rows) >= limit:
+        log.warning(
+            "%s: returned a full page of %d, so older rows may exist beyond the "
+            "limit and were not seen", what, len(rows),
+        )
+        return True
+    return False
+
+
 def _short(value: str) -> str:
     return value if len(value) <= 20 else f"{value[:17]}…"

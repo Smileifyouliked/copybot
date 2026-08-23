@@ -199,3 +199,25 @@ def test_resolved_market_is_settleable_after_the_fix(client, monkeypatch):
     meta = client.get_markets(["0xc"])["0xc"]
     assert meta.settlement_value("WIN") == 1.0
     assert meta.settlement_value("LOSE") == 0.0
+
+
+# --- paged responses have their own silent-omission mode -------------------
+
+def test_full_activity_page_warns_about_truncation(client, monkeypatch, caplog):
+    """A page that comes back exactly full means older rows were dropped
+    without any error. After an outage that is how his fill history gets
+    holes, which corrupts his VWAP and the sell-mirror fraction."""
+    import logging
+    monkeypatch.setattr(client, "_request", lambda m, u, **k: [{"i": i} for i in range(100)])
+    with caplog.at_level(logging.WARNING):
+        rows = client.get_activity("0xabc", limit=100)
+    assert len(rows) == 100
+    assert "full page" in caplog.text
+
+
+def test_partial_activity_page_is_silent(client, monkeypatch, caplog):
+    import logging
+    monkeypatch.setattr(client, "_request", lambda m, u, **k: [{"i": i} for i in range(7)])
+    with caplog.at_level(logging.WARNING):
+        client.get_activity("0xabc", limit=100)
+    assert "full page" not in caplog.text

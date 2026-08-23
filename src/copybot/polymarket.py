@@ -20,7 +20,7 @@ from typing import Any, Iterable, Sequence
 
 import httpx
 
-from .batch import reconcile_batch
+from .batch import assert_complete_page, reconcile_batch
 from .models import MarketMeta, OrderBook, parse_json_list
 
 log = logging.getLogger(__name__)
@@ -144,6 +144,12 @@ class PolymarketClient:
         )
         if not isinstance(data, list):
             raise PolymarketError(f"/activity returned {type(data).__name__}, expected list")
+        # A full page means the wallet traded at least `limit` times in the
+        # window we asked for, and anything older was dropped silently. After
+        # an outage that is how his fill history develops holes -- which
+        # corrupts his VWAP and the sell-mirroring fraction, even though the
+        # trades themselves are too old to copy.
+        assert_complete_page(data, limit, what="data-api /activity")
         return data
 
     # -- books -------------------------------------------------------------

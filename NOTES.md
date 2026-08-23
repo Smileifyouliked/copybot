@@ -453,6 +453,66 @@ typical fill size the book barely moves, at ours it does. But it is a
 
 ---
 
+## 8b. Standing rule: Polymarket omits silently
+
+Four separate instances now, every one returning HTTP 200 or a benign-looking
+status while handing back less than was asked for:
+
+| # | Call | Silent failure |
+|---|---|---|
+| 1 | gamma `/markets?condition_ids=` | unknown ids dropped from the response |
+| 2 | CLOB `POST /books` | tokens with no book omitted entirely |
+| 3 | CLOB `GET /book` | 404 for a resolved token, not an empty book |
+| 4 | gamma `/markets?condition_ids=` | **defaults to open-only; every resolved market invisible** |
+
+**The invariant, codebase-wide:** any call that requests a *set* must reconcile
+the response by ID, treat every absence as an explicit missing value, and log it
+at WARN. `batch.reconcile_batch()` is the only sanctioned way to consume one.
+Never index-align a response against a request.
+
+Paged calls have a different failure mode and their own guard. A page that
+returns exactly `limit` rows means the server had at least that many and
+dropped the rest without signalling. `batch.assert_complete_page()` warns on
+that. It matters for `/activity` specifically: after an outage longer than the
+window `limit` covers, his fill history develops holes, which corrupts his VWAP
+and the sell-mirroring fraction — even though the missed trades are too old to
+copy and so produce no visible symptom.
+
+### Audit of every call site (2026-08-23)
+
+| Call site | Kind | Status |
+|---|---|---|
+| `get_markets` | set | reconciled by conditionId; both resolution states requested |
+| `get_books` | set | reconciled by token id; absence becomes an explicit empty book |
+| `get_book` | single | 404 becomes an empty book, never retried |
+| `get_activity` | paged | full-page truncation warning |
+| `fee_rate_for` | via `get_markets` | inherits the guard |
+| `strategy.mark_positions` | consumes both | `.get()` with an explicit fallback chain |
+| `strategy.check_resolutions` | consumes `get_markets` | missing market skips rather than settles |
+| `strategy.next_mark_interval` | consumes `get_markets` | missing market keeps the default interval |
+
+No unguarded call sites remain.
+
+### Did the settlement bug corrupt CLV?
+
+**No.** Traced rather than assumed:
+
+* `closing_line_*` is written only when the mark source is `book_mid` or
+  `book_bid`, and those come from `get_books`, which was never broken. The
+  closing-line data collected so far is sound.
+* The `marks` table, which feeds fixed-horizon CLV, is likewise fed only from
+  `get_books`. Horizon CLV is sound.
+* What never happened is CLV *at close*: `_clv_fields` runs from `_settle`, and
+  `_settle` never ran. So the closing-line prices were captured and rolled
+  forward correctly but never frozen into `clv_abs`/`clv_pct`.
+* One thing **was** degraded: mark-to-market. A resolved position fell through
+  the gamma branch to `LAST_KNOWN`, so equity showed resolved positions at
+  their last traded book price instead of $1.00 or $0.00.
+
+Net: the collected data is usable, equity figures from before the fix are not.
+
+---
+
 ## 9. The mark path
 
 Marks are stored as **rows** in a `marks` table, not as a single overwritten
