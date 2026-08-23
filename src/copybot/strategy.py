@@ -459,7 +459,11 @@ class Strategy:
         realised = fill.net_usd - basis_released
         remaining_shares = max(0.0, our_shares - sold)
         remaining_basis = max(0.0, position["cost_basis_usd"] - basis_released)
-        fully_closed = closing_all or remaining_shares <= 1e-9
+        # Whether the position is closed depends on what actually SOLD, not on
+        # what we intended to sell. A thin bid side can absorb less than the
+        # whole position, and closing on intent zeroed the basis of shares we
+        # still held -- money that simply vanished from the ledger.
+        fully_closed = remaining_shares <= 1e-9
 
         with self.db.tx() as conn:
             self.db.record_processed(trade, "mirrored", conn=conn)
@@ -498,6 +502,13 @@ class Strategy:
                  sold, fill.avg_price, fill.net_usd, realised,
                  "closed" if fully_closed else f"{remaining_shares:.2f} left",
                  " [partial book]" if fill.is_partial else "")
+        if closing_all and not fully_closed:
+            log.warning(
+                "wanted to close %s entirely but the bids only absorbed %.4f of "
+                "%.4f shares; %.4f still held and will ride to resolution",
+                (position["question"] or position["token_id"])[:44], sold,
+                our_shares, remaining_shares,
+            )
 
     # =====================================================================
     # Resolution path

@@ -197,3 +197,54 @@ def test_capital_runs_out_and_says_so(db, shipped):
     assert len(db.open_positions()) <= 51
     ok, parts = db.reconcile()
     assert ok, parts
+
+
+# --- the leak that broke reconciliation in production ----------------------
+
+def test_partial_sell_of_a_full_close_keeps_the_unsold_shares(db, shipped):
+    """He sells everything, but the bid side can only absorb part of our
+    position. Closing on INTENT rather than on what actually sold zeroed the
+    basis of shares we still held, and the money vanished from the ledger --
+    this is what put the deployed database $0.06 out of balance."""
+    books = {"TOK1": make_book(asks=[(0.05, 100_000)], bids=[(0.09, 8)])}
+    ex = FakeExecutor(books=books)
+    cl = FakeClient(books=books, metas={"0xcond1": make_meta()})
+    s = Strategy(shipped, db, ex, cl, clock=lambda: T0)
+
+    s.process_trades([make_trade(price=0.05, shares=100.0, tx="0x1", ts=T0)])
+    pos = db.open_position_for_token("TOK1")
+    held = pos["shares"]
+    assert held > 8, "the position must exceed what the bids can absorb"
+
+    s.process_trades([make_trade(side="SELL", price=0.09, shares=100.0,
+                                 tx="0x2", ts=T0 + 10)])
+    after = db.get_position(pos["id"])
+    sold = [e for e in db.recent_executions(9) if e["side"] == "SELL"][0]
+
+    assert sold["shares"] < held, "the book should only have absorbed part"
+    assert after["status"] == "open", "unsold shares mean the position is still open"
+    assert after["shares"] == pytest.approx(held - sold["shares"])
+    assert after["cost_basis_usd"] > 0, "the unsold shares keep their cost basis"
+
+    ok, parts = db.reconcile()
+    assert ok, f"a partial close must not leak basis: {parts}"
+
+
+def test_full_close_still_closes_when_the_book_can_absorb_it(db, shipped):
+    """The fix must not stop a genuine full close from closing."""
+    books = {"TOK1": make_book(asks=[(0.05, 100_000)], bids=[(0.09, 100_000)])}
+    ex = FakeExecutor(books=books)
+    cl = FakeClient(books=books, metas={"0xcond1": make_meta()})
+    s = Strategy(shipped, db, ex, cl, clock=lambda: T0)
+
+    s.process_trades([make_trade(price=0.05, shares=100.0, tx="0x1", ts=T0)])
+    pos_id = db.open_position_for_token("TOK1")["id"]
+    s.process_trades([make_trade(side="SELL", price=0.09, shares=100.0,
+                                 tx="0x2", ts=T0 + 10)])
+    after = db.get_position(pos_id)
+    assert after["status"] == "closed"
+    assert after["shares"] == 0.0
+    assert after["cost_basis_usd"] == 0.0
+    assert after["exit_path"] == "mirrored_sell"
+    ok, parts = db.reconcile()
+    assert ok, parts

@@ -511,6 +511,31 @@ No unguarded call sites remain.
 
 Net: the collected data is usable, equity figures from before the fix are not.
 
+### Two bugs found by running it, not by reading it
+
+**Closing on intent instead of on outcome.** When he sold out of a token we
+set out to close our whole position, but a thin bid side can absorb less than
+we hold. The position was marked closed with `shares = 0` and
+`cost_basis_usd = 0` regardless, discarding the shares that did not sell along
+with their basis. The money left the ledger silently: reconciliation went out
+by exactly the basis of the unsold remainder. Found on the deployed database,
+which was $0.0587 out of balance, and reproduced at $1.40 on a deliberately
+thin book. Closure now depends on what actually sold, and an unsellable
+remainder stays held and is logged at WARN.
+
+Worth noting what this says about the invariant: `reconcile()` caught it, which
+is why it exists, but only as a number that did not add up. It could not say
+where the money went. The reproduction did.
+
+**Nothing stops two bots sharing one database.** A `screen` session from the
+earlier deployment path kept running for 41 hours alongside the systemd unit,
+both polling and both writing. No double-copy resulted -- the dedup key is a
+PRIMARY KEY and `BEGIN IMMEDIATE` serialises writers -- but the guard is
+checked *before* the transaction opens, so the race window is real and it
+simply did not fire. Two fixes pending: a lock file so a second instance
+refuses to start against a database another process holds, and moving the
+dedup check inside the write transaction.
+
 ---
 
 ## 9. The mark path
