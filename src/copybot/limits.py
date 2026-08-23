@@ -16,18 +16,20 @@ The model, deliberately conservative at every choice:
   * Only executed prints at or below our limit count. A print at or below our
     bid means a seller transacted at a price we were bidding at or above, so it
     consumed queue. Prints above our limit are irrelevant to us.
-  * Only prints labelled SELL count, and his own prints never do. A print at
-    or below our limit is only *our* fill if a seller hit the bid side; a buyer
-    lifting an ask at the same price consumes no bid queue at all. Counting
-    both would inflate the fill rate, which is the one number this whole
-    experiment turns on.
-    The `side` label could not be pinned down decisively -- classifying live
-    prints against a simultaneous quote yielded n=1, which is not evidence, and
-    a median comparison across two assets disagreed with itself. Taker-side is
-    the likelier reading and the single clean datapoint agrees. Requiring SELL
-    is correct under that reading and merely under-counts under the other, so
-    it errs the safe way either way. `limit_fill_requires_sell_prints: false`
-    relaxes it if the convention is ever established.
+  * His own prints never count. His buy cannot be the seller that fills our
+    bid, and letting it would mean trading against the wallet we copy.
+  * **Both `side` conventions are computed, every time.** A print at or below
+    our limit fills us only if a *seller* hit the bid; a buyer lifting an ask
+    at the same price consumes no bid queue. Which label means "seller" is not
+    established -- classifying live prints against a simultaneous quote yielded
+    n=1, and a median comparison across two assets disagreed with itself.
+    Picking one is not conservative: if the convention is inverted, requiring
+    SELL does not under-count, it measures a disjoint population, and the
+    direction of the error is unknown. So the configured convention drives the
+    position while the opposite one is computed alongside it and stored. If the
+    two track each other the ambiguity is moot; if they diverge we know it
+    matters before trusting either. `quotes.py` settles it from recorded
+    book snapshots.
   * Partial fills are real. An order that half-fills before its TTL expires
     leaves us with half a position, and that is recorded as such.
   * A maker fill pays NO fee. Confirmed against the live schedule, which
@@ -69,6 +71,12 @@ class RestingOrder:
     consumed_shares: float = 0.0   # tape volume seen at or below our price
     last_seen_ts: int = 0
     prints_observed: int = 0
+    # Measurement only -- the same order evaluated under the opposite `side`
+    # convention. Never drives the position; exists so the ambiguity is visible
+    # rather than assumed away.
+    alt_consumed_shares: float = 0.0
+    alt_filled_shares: float = 0.0
+    alt_prints_observed: int = 0
 
     @property
     def remaining_shares(self) -> float:
@@ -86,6 +94,13 @@ class RestingOrder:
         if self.target_shares <= 0:
             return 0.0
         return self.filled_shares / self.target_shares
+
+    @property
+    def alt_fill_fraction(self) -> float:
+        """Same order under the opposite `side` convention. Measurement only."""
+        if self.target_shares <= 0:
+            return 0.0
+        return self.alt_filled_shares / self.target_shares
 
 
 def queue_ahead_shares(book: OrderBook, limit_price: float) -> float:
@@ -153,8 +168,10 @@ def apply_tape(
     in reverse.
     """
     excluded = (exclude_wallet or "").lower()
-    volume = 0.0
-    prints = 0
+    primary_label = "SELL" if require_sell_prints else "BUY"
+    volume = alt_volume = 0.0
+    prints = alt_prints = 0
+
     for t in trades:
         try:
             ts = int(t["timestamp"])
@@ -168,15 +185,21 @@ def apply_tape(
             continue
         if price > order.limit_price + 1e-12:
             continue  # traded above us; our bid was never touched
-        if require_sell_prints and str(t.get("side", "")).upper() != "SELL":
-            continue  # a buyer lifting an ask consumes no bid-side queue
         if excluded and str(t.get("proxyWallet", "")).lower() == excluded:
             continue  # his own fill cannot be the seller that fills us
-        volume += size
-        prints += 1
+
+        side = str(t.get("side", "")).upper()
+        if side == primary_label:
+            volume += size
+            prints += 1
+        else:
+            alt_volume += size
+            alt_prints += 1
 
     order.consumed_shares = max(order.consumed_shares, volume)
     order.prints_observed = max(order.prints_observed, prints)
+    order.alt_consumed_shares = max(order.alt_consumed_shares, alt_volume)
+    order.alt_prints_observed = max(order.alt_prints_observed, alt_prints)
     order.last_seen_ts = now
 
     reachable = max(0.0, order.consumed_shares - order.queue_ahead_shares)
@@ -187,6 +210,11 @@ def apply_tape(
         order.filled_usd += gained * order.limit_price
         # takerOnly: true on every live schedule sampled, so a maker fill is free.
         order.fee_usd += 0.0
+
+    alt_reachable = max(0.0, order.alt_consumed_shares - order.queue_ahead_shares)
+    order.alt_filled_shares = max(
+        order.alt_filled_shares, min(order.target_shares, alt_reachable)
+    )
     return order
 
 

@@ -219,3 +219,42 @@ def test_relaxing_the_sell_requirement_counts_both():
     limits.apply_tape(o, [print_(0.03, 40, T0 + 10, side="BUY")], NO_FEE, T0 + 20,
                       require_sell_prints=False)
     assert o.filled_shares == pytest.approx(40)
+
+
+# --- both side conventions, computed side by side --------------------------
+
+def test_both_conventions_are_measured_every_time():
+    """Picking one convention is not conservative: if it is inverted we measure
+    a disjoint population, not a subset, and the error direction is unknown."""
+    o = order(book(bids=[]), his_price=0.03)
+    tape = [print_(0.03, 40, T0 + 5, side="SELL"),
+            print_(0.03, 90, T0 + 6, side="BUY")]
+    limits.apply_tape(o, tape, NO_FEE, T0 + 10)
+    assert o.filled_shares == pytest.approx(40)       # SELL drives the position
+    assert o.alt_filled_shares == pytest.approx(90)   # BUY measured alongside
+    assert o.prints_observed == 1 and o.alt_prints_observed == 1
+
+
+def test_alternate_convention_never_touches_the_position():
+    o = order(book(bids=[]), his_price=0.03)
+    limits.apply_tape(o, [print_(0.03, 500, T0 + 5, side="BUY")], NO_FEE, T0 + 10)
+    assert o.filled_shares == 0.0
+    assert o.filled_usd == 0.0
+    assert o.alt_filled_shares == pytest.approx(100)  # capped at target
+    assert o.alt_fill_fraction == pytest.approx(1.0)
+
+
+def test_conventions_agree_when_all_prints_share_a_label():
+    o = order(book(bids=[]), his_price=0.03)
+    limits.apply_tape(o, [print_(0.03, 30, T0 + 5, side="SELL")], NO_FEE, T0 + 10)
+    assert o.filled_shares == pytest.approx(30)
+    assert o.alt_filled_shares == 0.0
+
+
+def test_his_own_print_excluded_from_both_conventions():
+    o = order(book(bids=[]), his_price=0.03)
+    tape = [print_(0.03, 500, T0 + 5, side="SELL", wallet="0xHIM"),
+            print_(0.03, 500, T0 + 6, side="BUY", wallet="0xHIM")]
+    limits.apply_tape(o, tape, NO_FEE, T0 + 10, exclude_wallet="0xhim")
+    assert o.filled_shares == 0.0
+    assert o.alt_filled_shares == 0.0

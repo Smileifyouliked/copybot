@@ -5,6 +5,7 @@
     python -m copybot.main report       # the dashboard as text, no browser
     python -m copybot.main report --watch   # ...refreshing, like top
     python -m copybot.main export       # one bundle to hand an analyst
+    python -m copybot.main side-check   # settle the tape's `side` convention
     python -m copybot.main status       # one-line state dump
 """
 from __future__ import annotations
@@ -19,7 +20,8 @@ from .config import ConfigError, load_config
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="copybot")
     parser.add_argument("command",
-                        choices=["run", "dashboard", "report", "export", "status"])
+                        choices=["run", "dashboard", "report", "export", "side-check",
+                                 "status"])
     parser.add_argument("-c", "--config", default="config.yaml")
     parser.add_argument("--watch", action="store_true",
                         help="report only: redraw every --interval seconds")
@@ -51,6 +53,17 @@ def main(argv: list[str] | None = None) -> int:
 
     from .db import Database
     db = Database(cfg.db_path, cfg.starting_capital_usd)
+
+    if args.command == "side-check":
+        from .polymarket import PolymarketClient
+        from .quotes import classify
+        client = PolymarketClient()
+        try:
+            print(classify(db, client).summary())
+            return 0
+        finally:
+            client.close()
+            db.close()
 
     if args.command == "export":
         from .exportbundle import build

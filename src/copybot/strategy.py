@@ -145,21 +145,17 @@ class Strategy:
         budget = self.cfg.stake_per_copy_usd
         remaining = budget - spent
 
-        if copies < self.cfg.max_copies_per_token and remaining > 0.01:
+        tranches = self._tranche_count(book, trade.price, budget)
+        if copies < tranches and remaining > 0.01:
             # Follow him down. He averages ~5 fills per token and lands well
             # below his opener, so taking only his first fill makes his VWAP
             # unreachable by construction. The schedule splits one budget across
             # his successive fills; it never adds a second budget.
-            share = self.cfg.stake_schedule[min(copies, len(self.cfg.stake_schedule) - 1)]
-            stake = min(budget * share, remaining)
-            # The schedule and the exchange floor pull against each other: at
-            # 29c a $1.02 tranche buys 3.5 shares, under the 5-share minimum,
-            # so the whole tranche would be unplaceable. Size up to whatever
-            # clears the floor -- spending the budget in fewer, larger pieces
-            # rather than in pieces that cannot be placed at all -- and never
-            # past the remaining budget.
-            if self.cfg.respect_min_order_size and trade.price > 0:
-                floor_usd = book.min_order_size * trade.price * 1.05
+            shape = self.cfg.stake_schedule[:tranches]
+            total = sum(shape) or 1.0
+            stake = min(budget * (shape[copies] / total), remaining)
+            floor_usd = self._min_tranche_usd(book, trade.price)
+            if floor_usd > 0:
                 stake = min(max(stake, floor_usd), remaining)
                 # If what would be left over is itself too small to place, it
                 # can never be spent and would sit stranded for the life of the
@@ -229,34 +225,74 @@ class Strategy:
 
             slip_vwap = fill.avg_price - his_vwap
             slip_vwap_pct = (slip_vwap / his_vwap * 100.0) if his_vwap > 0 else 0.0
-            position_id = self.db.insert_position(
-                conn,
-                token_id=trade.token_id, condition_id=trade.condition_id,
-                question=trade.title, outcome=trade.outcome,
-                outcome_index=trade.outcome_index,
-                status="open", opened_ts=decision_ts,
-                shares=fill.shares, shares_opened=fill.shares,
-                cost_basis_usd=fill.gross_usd + fill.fee_usd,
-                cost_basis_opened=fill.gross_usd + fill.fee_usd,
-                our_avg_fill=fill.avg_price, entry_fee_usd=fill.fee_usd,
-                entry_band=band,
-                his_first_price=trade.price, his_first_ts=trade.traded_ts,
-                his_vwap_entry=his_vwap, his_fill_count=his_n,
-                his_total_shares=his_shares, his_total_usd=his_usd,
-                # Two size ratios: against the fill we copied, and against his
-                # whole position, which is the one that says how much bigger
-                # our bet is than his conviction.
-                size_ratio=(stake / trade.usd_size) if trade.usd_size > 0 else None,
-                his_position_usd_at_copy=his_usd,
-                his_position_usd_total=his_usd,
-                size_ratio_vs_total=(stake / his_usd) if his_usd > 0 else None,
-                slippage_vs_his_entry=slip_abs,
-                slippage_vs_his_entry_pct=slip_pct,
-                slippage_vs_his_vwap=slip_vwap,
-                slippage_vs_his_vwap_pct=slip_vwap_pct,
-                last_mark_price=fill.avg_price, last_mark_ts=decision_ts,
-                last_mark_source=MarkSource.ENTRY_PRICE.value,
-            )
+            existing = self.db.open_position_for_token(trade.token_id)
+            if existing is not None:
+                # Following him down adds to the SAME position rather than
+                # opening another. Three tranches into one token is one holding
+                # with an averaged entry -- anything else makes "our VWAP vs
+                # his VWAP" per token meaningless and settles the token three
+                # times over.
+                position_id = existing["id"]
+                shares_total = existing["shares"] + fill.shares
+                gross_total = (existing["our_avg_fill"] * existing["shares_opened"]
+                               + fill.gross_usd)
+                shares_opened = existing["shares_opened"] + fill.shares
+                our_vwap = gross_total / shares_opened if shares_opened else fill.avg_price
+                self.db.update_position(
+                    conn, position_id,
+                    shares=shares_total,
+                    shares_opened=shares_opened,
+                    cost_basis_usd=existing["cost_basis_usd"] + fill.gross_usd + fill.fee_usd,
+                    cost_basis_opened=existing["cost_basis_opened"] + fill.gross_usd + fill.fee_usd,
+                    our_avg_fill=our_vwap,
+                    entry_fee_usd=existing["entry_fee_usd"] + fill.fee_usd,
+                    entry_band=entry_band(our_vwap),
+                    his_vwap_entry=his_vwap,
+                    his_fill_count=his_n,
+                    his_total_shares=his_shares,
+                    his_total_usd=his_usd,
+                    his_position_usd_total=his_usd,
+                    size_ratio_vs_total=((existing["cost_basis_opened"] + fill.gross_usd
+                                          + fill.fee_usd) / his_usd) if his_usd > 0 else None,
+                    slippage_vs_his_entry=our_vwap - existing["his_first_price"],
+                    slippage_vs_his_entry_pct=(
+                        (our_vwap - existing["his_first_price"]) / existing["his_first_price"] * 100.0
+                        if existing["his_first_price"] else None),
+                    slippage_vs_his_vwap=our_vwap - his_vwap,
+                    slippage_vs_his_vwap_pct=(
+                        (our_vwap - his_vwap) / his_vwap * 100.0 if his_vwap > 0 else None),
+                    last_mark_price=fill.avg_price, last_mark_ts=decision_ts,
+                )
+            else:
+                position_id = self.db.insert_position(
+
+                    conn,
+                    token_id=trade.token_id, condition_id=trade.condition_id,
+                    question=trade.title, outcome=trade.outcome,
+                    outcome_index=trade.outcome_index,
+                    status="open", opened_ts=decision_ts,
+                    shares=fill.shares, shares_opened=fill.shares,
+                    cost_basis_usd=fill.gross_usd + fill.fee_usd,
+                    cost_basis_opened=fill.gross_usd + fill.fee_usd,
+                    our_avg_fill=fill.avg_price, entry_fee_usd=fill.fee_usd,
+                    entry_band=band,
+                    his_first_price=trade.price, his_first_ts=trade.traded_ts,
+                    his_vwap_entry=his_vwap, his_fill_count=his_n,
+                    his_total_shares=his_shares, his_total_usd=his_usd,
+                    # Two size ratios: against the fill we copied, and against his
+                    # whole position, which is the one that says how much bigger
+                    # our bet is than his conviction.
+                    size_ratio=(stake / trade.usd_size) if trade.usd_size > 0 else None,
+                    his_position_usd_at_copy=his_usd,
+                    his_position_usd_total=his_usd,
+                    size_ratio_vs_total=(stake / his_usd) if his_usd > 0 else None,
+                    slippage_vs_his_entry=slip_abs,
+                    slippage_vs_his_entry_pct=slip_pct,
+                    slippage_vs_his_vwap=slip_vwap,
+                    slippage_vs_his_vwap_pct=slip_vwap_pct,
+                    last_mark_price=fill.avg_price, last_mark_ts=decision_ts,
+                    last_mark_source=MarkSource.ENTRY_PRICE.value,
+                )
             self.db.insert_execution(
                 conn, position_id=position_id, trade_key=trade.trade_key,
                 token_id=trade.token_id, condition_id=trade.condition_id,
@@ -291,6 +327,41 @@ class Strategy:
         if slip_pct > self.cfg.slippage_warn_pct:
             log.warning("SLIPPAGE %+.1f%% on %s -- above the %.0f%% warning level",
                         slip_pct, trade.title[:44], self.cfg.slippage_warn_pct)
+
+    def _min_tranche_usd(self, book, price: float) -> float:
+        """Smallest placeable order at this price, in dollars.
+
+        Mode-dependent, because the stake includes fees. A maker fill pays
+        nothing (`takerOnly: true`), so the floor is just `min_shares x price`.
+        A taker fill pays `rate x p x (1-p)` per share, which at 29c lifts the
+        5-share floor from $1.45 to $1.50 -- and two of those no longer fit in
+        a $3 budget. So the same price supports two tranches resting and only
+        one crossing.
+        """
+        if not self.cfg.respect_min_order_size or price <= 0:
+            return 0.0
+        per_share = price
+        if self.cfg.entry_mode == "market":
+            per_share += self.cfg.fee_rate_fallback * price * (1.0 - price)
+        return book.min_order_size * per_share
+
+    def _tranche_count(self, book, price: float, budget: float) -> int:
+        """How many placeable tranches this price allows.
+
+        The binding constraint is `tranche >= min_shares x price`, so the count
+        is `floor(budget / (min_shares x price))`. Deriving it from price rather
+        than fixing it means follow-him-down keeps working across the whole
+        band: at 2c the budget supports 30 tranches, at 20c exactly 3, at 29c
+        two of ~$1.50 each at 5.17 shares. Collapsing to a single fill above 20c
+        would disable follow-him-down across his 20-30c band -- his second-best
+        by return, and the one where a single early fill hurts most because the
+        absolute price gap is widest.
+        """
+        cap = self.cfg.max_copies_per_token
+        floor_usd = self._min_tranche_usd(book, price)
+        if floor_usd <= 0:
+            return cap
+        return max(1, min(int(budget // floor_usd), cap))
 
     def _ladder_rungs(self, trade: TargetTrade) -> list[tuple[str, float]]:
         """Fixed rungs plus his own size.
