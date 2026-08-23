@@ -1,0 +1,199 @@
+"""End-to-end against the real config.yaml — the settings actually deployed.
+
+The other suites pin an explicit legacy config so they keep testing the thing
+they were written for. That leaves the shipped configuration under-tested: one
+test on the config being run is worth more than a hundred on one that isn't.
+
+This walks the whole lifecycle under the real file: tranched entry under the
+30c cap, a mirrored partial sell, and settlement, checking the ledger
+reconciles at every step.
+"""
+import pytest
+
+from conftest import FakeClient, FakeExecutor, make_book, make_meta, make_trade
+
+from copybot.config import load_config
+from copybot.models import SkipReason
+from copybot.strategy import Strategy
+
+T0 = 1_787_000_000
+
+
+@pytest.fixture
+def shipped():
+    from pathlib import Path
+    return load_config(Path(__file__).resolve().parents[1] / "config.yaml")
+
+
+def build(db, cfg, price, now=T0):
+    books = {"TOK1": make_book(asks=[(price, 100_000)], bids=[(price - 0.005, 100_000)])}
+    ex = FakeExecutor(books=books)
+    cl = FakeClient(books=books, metas={"0xcond1": make_meta()})
+    return Strategy(cfg, db, ex, cl, clock=lambda: now), ex, cl
+
+
+def buys(db):
+    return [e for e in db.recent_executions(50) if e["side"] == "BUY"]
+
+
+# --- the settings themselves ----------------------------------------------
+
+def test_shipped_config_is_the_one_we_think_it_is(shipped):
+    assert shipped.mode == "paper"
+    assert shipped.max_entry_price == 0.30
+    assert shipped.shadow_band_max_price == 0.50
+    assert shipped.stake_per_copy_usd == 3.00
+    assert shipped.starting_capital_usd == 150.00
+    assert abs(sum(shipped.stake_schedule) - 1.0) < 1e-9
+    assert shipped.max_copies_per_token <= len(shipped.stake_schedule)
+    assert shipped.vwap_breakeven_ratio == 1.395
+    assert shipped.fee_rate_fallback > 0
+    assert shipped.dashboard_host == "127.0.0.1"
+
+
+def test_shipped_config_refuses_live_mode(shipped):
+    import dataclasses
+
+    from copybot.config import ConfigError, _validate
+    with pytest.raises(ConfigError, match="not implemented"):
+        _validate(dataclasses.replace(shipped, mode="live"))
+
+
+def test_shipped_config_refuses_unwired_limit_mode(shipped):
+    import dataclasses
+
+    from copybot.config import ConfigError, _validate
+    with pytest.raises(ConfigError, match="not wired"):
+        _validate(dataclasses.replace(shipped, entry_mode="limit"))
+
+
+# --- buy path --------------------------------------------------------------
+
+def test_cheap_entry_tranches_three_ways_under_the_cap(db, shipped):
+    """At 2c the budget supports many tranches, so the schedule applies in
+    full and the total never exceeds one budget."""
+    s, _, _ = build(db, shipped, 0.02)
+    for i in range(5):
+        s.process_trades([make_trade(price=0.02, tx=f"0x{i}", ts=T0 + i)])
+    rows = buys(db)
+    assert len(rows) == shipped.max_copies_per_token
+    total = sum(-e["net_usd"] for e in rows)
+    assert total == pytest.approx(shipped.stake_per_copy_usd, abs=0.01)
+    ok, parts = db.reconcile()
+    assert ok, parts
+
+
+def test_expensive_entry_tranches_twice_when_resting(db, shipped):
+    """29c is inside his +45.4% band. Resting pays no fee, so the 5-share floor
+    is $1.45 and two $1.50 tranches fit at 5.17 shares each -- follow-him-down
+    survives up here, which matters most where the absolute price gap is widest."""
+    import dataclasses
+    cfg = dataclasses.replace(shipped, entry_mode="limit")
+    s, _, _ = build(db, cfg, 0.29)
+    for i in range(4):
+        s.process_trades([make_trade(price=0.29, tx=f"0x{i}", ts=T0 + i)])
+    rows = buys(db)
+    assert len(rows) == 2, "collapsing to one fill disables follow-him-down at 29c"
+    assert all(e["shares"] >= 5.0 for e in rows)
+    assert sum(-e["net_usd"] for e in rows) <= shipped.stake_per_copy_usd + 1e-6
+    ok, _ = db.reconcile()
+    assert ok
+
+
+def test_expensive_entry_collapses_to_one_when_crossing(db, shipped):
+    """Crossing pays the taker fee, which lifts the same floor to $1.50. Two of
+    those do not fit in $3, so market mode genuinely gets one fill at 29c.
+    That is a real cost of crossing, not a sizing bug."""
+    s, _, _ = build(db, shipped, 0.29)
+    for i in range(4):
+        s.process_trades([make_trade(price=0.29, tx=f"0x{i}", ts=T0 + i)])
+    rows = buys(db)
+    assert len(rows) == 1
+    assert sum(-e["net_usd"] for e in rows) <= shipped.stake_per_copy_usd + 1e-6
+
+
+def test_entry_above_the_cap_is_refused(db, shipped):
+    s, _, _ = build(db, shipped, 0.35)
+    c = s.process_trades([make_trade(price=0.35, ts=T0)])
+    assert c.copied == 0
+    assert db.recent_skips()[0]["reason"] == SkipReason.PRICE_ABOVE_MAX_ENTRY.value
+
+
+def test_shadow_band_signal_records_a_ladder_without_spending(db, shipped):
+    """35c is outside the traded universe but inside the shadow band, so it
+    must still leave measurements behind."""
+    s, _, _ = build(db, shipped, 0.35)
+    s.process_trades([make_trade(price=0.35, ts=T0)])
+    assert buys(db) == []
+    assert db.cash() == pytest.approx(shipped.starting_capital_usd)
+
+
+# --- full lifecycle --------------------------------------------------------
+
+def test_buy_then_mirrored_sell_then_reconcile(db, shipped):
+    s, ex, cl = build(db, shipped, 0.05)
+    for i in range(3):
+        s.process_trades([make_trade(price=0.05, shares=100.0, tx=f"0x{i}", ts=T0 + i)])
+    opened = db.open_position_for_token("TOK1")
+    assert opened is not None
+    staked = sum(-e["net_usd"] for e in buys(db))
+    assert staked == pytest.approx(shipped.stake_per_copy_usd, abs=0.01)
+
+    ex.books["TOK1"] = make_book(asks=[(0.11, 100_000)], bids=[(0.10, 100_000)])
+    s.process_trades([make_trade(side="SELL", price=0.10, shares=150.0,
+                                 tx="0xs", ts=T0 + 20)])
+    after = db.get_position(opened["id"])
+    assert after["shares"] < opened["shares"], "his 50% sell must be mirrored"
+    ok, parts = db.reconcile()
+    assert ok, parts
+
+
+def test_buy_then_resolution_settles_and_reconciles(db, shipped):
+    s, _, cl = build(db, shipped, 0.05)
+    for i in range(3):
+        s.process_trades([make_trade(price=0.05, tx=f"0x{i}", ts=T0 + i)])
+    pos_id = db.open_position_for_token("TOK1")["id"]
+    shares = db.get_position(pos_id)["shares"]
+    staked = sum(-e["net_usd"] for e in buys(db))
+
+    cl.metas["0xcond1"] = make_meta(prices=(1.0, 0.0), closed=True)
+    assert s.check_resolutions() == 1
+
+    closed = db.get_position(pos_id)
+    assert closed["status"] == "closed"
+    assert closed["exit_path"] == "resolution"
+    assert closed["proceeds_usd"] == pytest.approx(shares * 1.00)
+    assert db.cash() == pytest.approx(
+        shipped.starting_capital_usd - staked + shares, abs=1e-6)
+    ok, parts = db.reconcile()
+    assert ok, parts
+
+
+def test_losing_resolution_under_shipped_config(db, shipped):
+    s, _, cl = build(db, shipped, 0.05)
+    s.process_trades([make_trade(price=0.05, ts=T0)])
+    staked = sum(-e["net_usd"] for e in buys(db))
+    cl.metas["0xcond1"] = make_meta(prices=(0.0, 1.0), closed=True)
+    s.check_resolutions()
+    assert db.cash() == pytest.approx(shipped.starting_capital_usd - staked)
+    ok, _ = db.reconcile()
+    assert ok
+
+
+def test_capital_runs_out_and_says_so(db, shipped):
+    """$150 at $3 a fully-funded token is 50 tokens. Fill each one to its whole
+    budget and the 51st must be refused for cash, never overdrawn."""
+    s, ex, cl = build(db, shipped, 0.02)
+    for i in range(55):
+        ex.books[f"T{i}"] = make_book(token_id=f"T{i}", asks=[(0.02, 100_000)],
+                                      bids=[(0.015, 100_000)])
+        cl.books[f"T{i}"] = ex.books[f"T{i}"]
+        for j in range(shipped.max_copies_per_token):
+            s.process_trades([make_trade(token_id=f"T{i}", price=0.02,
+                                         tx=f"0x{i}_{j}", ts=T0 + i * 10 + j)])
+        assert db.cash() >= 0.0, "cash must never go negative"
+    reasons = {r["reason"] for r in db.recent_skips(400)}
+    assert SkipReason.NOT_ENOUGH_CASH.value in reasons
+    assert len(db.open_positions()) <= 51
+    ok, parts = db.reconcile()
+    assert ok, parts
