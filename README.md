@@ -157,14 +157,23 @@ now** — the next step does not ask twice.
 
 ### 3. Delete it
 
+**`cd ~` first.** If your shell is sitting inside `~/copybot` when you delete
+it, the shell is left with a working directory that no longer exists, and
+everything after it fails with `getcwd() failed: No such file or directory` --
+including the `git clone`, which cannot run from a directory that is gone. The
+recovery is just `cd ~`, but it is easier to not step in it.
+
 ```bash
+cd ~
 rm -rf ~/copybot
 ls ~/copybot 2>&1                             # "No such file or directory"
+pwd                                           # /home/ubuntu -- a real directory
 ```
 
 ### 4. Install clean
 
 ```bash
+cd ~                                          # never clone from a deleted cwd
 sudo apt update && sudo apt install -y python3-venv git screen
 git clone https://github.com/Smileifyouliked/copybot.git ~/copybot
 cd ~/copybot
