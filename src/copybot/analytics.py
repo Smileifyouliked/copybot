@@ -340,7 +340,27 @@ def stopping_rules(db: Database, cfg) -> dict:
     ).fetchone()["n"]
     stable = days_without_stall(db)
 
+    # The ratio kill: this is the condition the whole limit-order run exists to
+    # test, so it sits first. Above 1.395 the wallet's +41.3% net edge on the
+    # sub-50c slice is spent entirely on our entry, and no amount of him being
+    # right afterwards gets it back.
+    ratio = db.vwap_ratio_stats(breakeven=cfg.kill_vwap_ratio)
+    ratio_value = ratio["mean"]
+    if ratio["n"] < cfg.kill_vwap_min_fills or ratio_value is None:
+        ratio_status = "waiting"
+    elif ratio_value > cfg.kill_vwap_ratio:
+        ratio_status = "breach"
+    else:
+        ratio_status = "ok"
+
     kill = [
+        {
+            "name": "What we pay vs what he pays",
+            "value": f"{ratio_value:.3f}x" if ratio_value is not None else "—",
+            "threshold": f"over {cfg.kill_vwap_ratio:.3f}x",
+            "status": ratio_status,
+            "progress": f"{ratio['n']} / {cfg.kill_vwap_min_fills} bets bought",
+        },
         depth_rule(stake_label, f"Depth cost at {stake_label}"),
         depth_rule("$1", "Depth cost at $1"),
         {

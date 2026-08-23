@@ -511,6 +511,31 @@ No unguarded call sites remain.
 
 Net: the collected data is usable, equity figures from before the fix are not.
 
+### Two bugs found by running it, not by reading it
+
+**Closing on intent instead of on outcome.** When he sold out of a token we
+set out to close our whole position, but a thin bid side can absorb less than
+we hold. The position was marked closed with `shares = 0` and
+`cost_basis_usd = 0` regardless, discarding the shares that did not sell along
+with their basis. The money left the ledger silently: reconciliation went out
+by exactly the basis of the unsold remainder. Found on the deployed database,
+which was $0.0587 out of balance, and reproduced at $1.40 on a deliberately
+thin book. Closure now depends on what actually sold, and an unsellable
+remainder stays held and is logged at WARN.
+
+Worth noting what this says about the invariant: `reconcile()` caught it, which
+is why it exists, but only as a number that did not add up. It could not say
+where the money went. The reproduction did.
+
+**Nothing stops two bots sharing one database.** A `screen` session from the
+earlier deployment path kept running for 41 hours alongside the systemd unit,
+both polling and both writing. No double-copy resulted -- the dedup key is a
+PRIMARY KEY and `BEGIN IMMEDIATE` serialises writers -- but the guard is
+checked *before* the transaction opens, so the race window is real and it
+simply did not fire. Two fixes pending: a lock file so a second instance
+refuses to start against a database another process holds, and moving the
+dedup check inside the write transaction.
+
 ---
 
 ## 9. The mark path
@@ -584,9 +609,13 @@ hard line, and it replaces single-fill slippage as the metric that matters.
   at $3 exceeds 25%, $3 is not viable. Retest at $1 before killing outright.
 * **Depth, $1:** if median depth cost at $1 also exceeds 25% across 50+
   signals, the strategy is unreachable at any size I'd trade. Kill.
-* **Entry quality:** after 50 filled copies, if median (our VWAP / his VWAP)
+* **Entry quality:** after 50 filled copies, if mean (our VWAP / his VWAP)
   exceeds **1.395**, limit orders did not solve the problem and the strategy is
-  unreachable at our execution quality. Kill.
+  unreachable at our execution quality. Kill. *(Wired: it is the first row of
+  the stopping-rule table in both the dashboard and the text report. The
+  threshold reads the mean rather than the median because the mean is what the
+  arithmetic behind 1.395 is about -- total spent over total he spent -- and a
+  median hides a tail of terrible entries.)*
 * **CLV:** after 100 copies, if median CLV at the +60min horizon is negative,
   kill regardless of P&L.
 * **Metric integrity:** if closing-line capture failure exceeds 30%, stop and
@@ -656,6 +685,145 @@ dashboard off localhost. Don't set it.
 
 ---
 
+## 11b. Limit orders: what the run 2 code actually does
+
+Run 1 crossed the spread. Its own numbers killed it: fills landed 11-197% above
+his price against a break-even of 1.395x. Run 2 rests at his price instead. This
+section is the assumption list for that change, because every line here is a
+choice that could be wrong.
+
+### The model
+
+* **We rest at his exact fill price.** Never one tick better, never a chase.
+  The order fills at that price or it does not fill at all, so the metric stops
+  being "how much worse did we pay" and becomes "how often did we get in".
+* **We join at the BACK of the queue.** Everything already bidding at our price
+  or better must trade before we get a share. This is the conservative reading
+  and it is almost certainly correct for a taker-driven book.
+* **Only executed prints fill us.** A quote at our price is not a trade at our
+  price. Fills come from `data-api /trades`, never from the book.
+* **Only prints on OUR token count.** The tape is fetched per market and a
+  market has two tokens; a 20c print on the complementary outcome is a
+  different book with a different queue. Every live row carries `asset`, so the
+  filter is exact.
+* **His own prints never count.** His buy is not the seller filling our bid.
+* **Prints from before we placed never count.** That is look-ahead in reverse.
+* **Maker fills pay no fee.** `takerOnly: true` on every schedule sampled.
+* **TTL is 300s.** After that the order is cancelled. An expired order costs
+  nothing, books nothing, and frees both its budget and its slot.
+* **A book already offering at or below his price is CROSSED, not rested.**
+  Resting there would cross anyway. It pays the taker fee and is recorded as
+  `crossed_inside`, separately from resting fills, so it cannot flatter the
+  fill rate.
+
+### What could still be wrong with it
+
+* **The `side` convention is unresolved.** Which label means "a seller hit the
+  bid" was never pinned down: classifying live prints against a simultaneous
+  quote yielded n=1, and a median comparison across two assets disagreed with
+  itself. Picking one is NOT conservative -- under the inverted reading we are
+  not under-counting, we are measuring a disjoint population, and the direction
+  of the error is unknown. So the configured convention drives the position and
+  the opposite reading is computed and stored on every order. If the two
+  diverge by more than 10 points the dashboard says so and neither number can
+  be used until `side-check` settles it.
+* **Queue position is modelled, not observed.** We cannot see our own order in
+  a real queue because there is no order. Back-of-queue is an assumption.
+* **No cancel/replace.** He may fill at a price we are still waiting at,
+  because the market traded through him and not through us. We take the miss.
+
+### Fill rate is the experiment
+
+Of his buys we tried to match, what fraction filled at his price? That number
+decides the project. It appears on the dashboard, in the text report, and in
+`compare`, always alongside the opposite-convention reading.
+
+## 11c. Following him down, and what is NOT deployed
+
+The per-token budget is a hard cap. The schedule ([0.34, 0.33, 0.33]) is the
+intended split across his successive fills, and the exchange minimum is a hard
+floor under each tranche.
+
+**Nothing is ever rounded up to consume the rest of the budget.** An earlier
+version absorbed a remainder that could not clear the floor at the current
+price. That was wrong: an unspendable remainder costs an under-deployed token,
+while absorbing it costs his *opening* price -- the single worst price he pays,
+and the exact thing follow-him-down exists to avoid. The remainder is not
+stranded, either: the floor is a share count, so it shrinks as the price falls,
+and the fills we are waiting for are the cheaper ones. Expect deployed capital
+per token to run below the nominal budget; that is the design, not a leak.
+
+**A resting order counts against the cap.** Cash has not moved, but if it fills
+it fills. Before this, four of his fills placed four orders against a
+three-order budget and nothing checked it until the tape did.
+
+**The floor follows what will actually happen, not what the mode is called.**
+Crossing pays the taker fee, so its floor is `5 x (p + rate x p x (1-p))`.
+Resting pays nothing, so its floor is `5 x p`. At 29c that is $1.50 versus
+$1.45 -- the difference between one tranche and two.
+
+**Known gap:** the floor is computed at HIS price, but a market-mode fill
+happens at the BOOK's price. When the book has moved away from him, the order
+is sized for his price and refused for the book's. In limit mode this cannot
+happen (we rest at his price); in market mode the refusal is the safe outcome,
+so it is left alone rather than sized up to chase a price we already decided
+was too far away.
+
+## 11d. Stake as a tested variable
+
+$1 / $2 / $3, assigned per token by hashing the token id, so a restart keeps
+the assignment and a token never moves between arms mid-position.
+
+Rationale: a resting order is punished by **queue position**, not by depth. A
+smaller order can fill far more often at the same price, which is the opposite
+of how crossing behaves -- crossing punishes size through the book. So the size
+trade-off inverts under limit orders and has to be measured rather than
+assumed.
+
+**Variants apply in limit mode only.** In market mode, depth cost is already
+measured by the shadow ladder and varying size would add noise to a run that
+cannot answer the question anyway.
+
+**The confound, stated plainly:** the exchange minimum is a share count, so its
+dollar value rises with price. At the 5-share minimum a $1 order is unplaceable
+above 20c. Rather than silently dropping the whole 20-30c band out of the $1
+arm -- measuring a different population, again -- a token snaps up to the
+smallest variant that is placeable at that price. The arms therefore still
+cover different price distributions below 20c. **This is physical, not
+fixable.** Compare variants WITHIN a price band; a pooled comparison of the
+arms is a comparison of prices wearing a stake's clothing.
+
+## 11e. Runs, archiving and comparison
+
+* A run is **never deleted.** Run 1 cost real observation time and is the only
+  baseline run 2 can be judged against.
+* `archive` copies the database aside through SQLite's backup API (not `cp`, so
+  a running bot mid-transaction cannot hand us a torn file), stamps the copy
+  with a UTC timestamp, and leaves the original untouched. Refuses to overwrite
+  an existing archive.
+* Every run is stamped into `runs` with a JSON snapshot of the config that
+  produced it. A config file that has since been edited cannot answer "what
+  were the settings then".
+* Every position and every resting order carries its `run_id`, so one database
+  spanning a market run and a limit run still answers either question.
+* `compare` reports **entry quality only** -- our VWAP over his VWAP, fill rate
+  under both conventions. **P&L is deliberately excluded**: two runs see
+  different markets at different times, so a P&L gap between them is mostly
+  which coin flips landed. The ratio is normalised by his own price on his own
+  picks, which is why it survives the comparison and P&L does not.
+
+## 11f. One bot per database
+
+Enforced with `flock` on `<db_path>.lock`, taken before the database is opened.
+A second instance refuses to start and exits 3.
+
+This exists because it already happened: a manually started process ran
+alongside the systemd unit for 41 hours against the same file. No copy was
+made twice -- dedup held -- but two writers racing the same read-then-write
+window is not a property to leave to luck. `flock` rather than a PID file
+because the kernel releases it however the process dies, so a stale file can
+never lock the bot out.
+
 ## 12. Still open
 
 - Whether a disputed UMA resolution can reverse a settlement we already booked.
@@ -668,3 +836,14 @@ dashboard off localhost. Don't set it.
 - The strategy's real latency slippage. Still unmeasurable retrospectively; the
   cold-start run produced only 3 fills and those carried a +124% average, which
   is a sample of three against a book that had moved, not a slippage estimate.
+- Whether the tape's `side` label is the taker's or the maker's. Both readings
+  are computed on every resting order; `side-check` settles it once 30+ prints
+  can be classified against a simultaneous quote. Until then no fill-rate
+  number is trustworthy on its own.
+- Whether back-of-queue is pessimistic enough. We never see our own order in a
+  real queue, so the assumption cannot be validated from paper trading alone.
+- Two positions in the run-1 database show $0.63 and $1.48 paid rather than
+  $3.00. Not yet explained. Most likely the book ran out of asks inside our
+  price cap and the walk filled what it could, but it has not been traced back
+  to those specific rows, and it should be before run 1's numbers are used as
+  the baseline.

@@ -27,41 +27,62 @@ def spend(db):
     return sum(-e["net_usd"] for e in db.recent_executions(50) if e["side"] == "BUY")
 
 
+def budget(s, token="TOK1", price=0.20, book=None):
+    """The cap this token was actually assigned.
+
+    Under the shipped config the per-token budget is a stake variant, not a
+    constant, so a test that hard-codes stake_per_copy_usd is testing a config
+    nobody is running. Ask the strategy what it assigned instead."""
+    return s.budget_for(token, book if book is not None else deep(price)[token], price)
+
+
 # --- the hard cap ----------------------------------------------------------
 
 def test_three_fills_never_exceed_one_budget(db, cfg):
+    """Six of his fills at one price, one budget.
+
+    What is left undeployed must be undeployed for a reason: less than one
+    placeable order at that price. The budget is never rounded up to consume
+    the remainder -- doing that would buy his opening price, which is the price
+    the whole strategy is trying not to be stuck at. The remainder stays
+    available for a cheaper fill, where the same 5-share floor costs less.
+    """
     s, _, _ = build(db, cfg)
+    cap = budget(s)
     for i in range(6):
         s.process_trades([make_trade(price=0.20, tx=f"0x{i}", ts=1_787_000_000 + i)])
-    assert spend(db) <= cfg.stake_per_copy_usd + 1e-6
-    assert spend(db) == pytest.approx(cfg.stake_per_copy_usd, abs=0.02), \
-        "the budget should be fully deployed, not stranded below the floor"
+    assert spend(db) <= cap + 1e-6
+    floor_usd = s._min_tranche_usd(deep()["TOK1"], 0.20)
+    assert cap - spend(db) < floor_usd, \
+        "undeployed budget must be smaller than one placeable order"
 
 
 def test_stake_schedule_splits_the_budget_at_cheap_prices(db, cfg):
     """At 2c a scheduled tranche clears the 5-share floor easily, so the split
     is exactly the schedule."""
     s, _, _ = build(db, cfg, books=deep(0.02))
+    cap = budget(s, price=0.02)
     for i in range(3):
         s.process_trades([make_trade(price=0.02, tx=f"0x{i}", ts=1_787_000_000 + i)])
     buys = sorted((e["id"], -e["net_usd"]) for e in db.recent_executions(20)
                   if e["side"] == "BUY")
     amounts = [round(u, 2) for _, u in buys]
-    expected = [round(cfg.stake_per_copy_usd * f, 2) for f in cfg.stake_schedule]
+    expected = [round(cap * f, 2) for f in cfg.stake_schedule]
     assert amounts == expected
-    assert sum(amounts) == pytest.approx(cfg.stake_per_copy_usd, abs=0.01)
+    assert sum(amounts) == pytest.approx(cap, abs=0.01)
 
 
 def test_tranche_is_sized_up_to_clear_the_exchange_floor(db, cfg):
     """At 29c a scheduled $1.02 tranche buys 3.5 shares, under the 5-share
     minimum. Sizing up keeps the order placeable; the budget stays capped."""
     s, _, _ = build(db, cfg, books=deep(0.29))
+    cap = budget(s, price=0.29)
     s.process_trades([make_trade(price=0.29, tx="0x1", ts=1_787_000_000)])
     buys = [e for e in db.recent_executions(20) if e["side"] == "BUY"]
     assert len(buys) == 1
     assert buys[0]["shares"] >= 5.0, "order must clear the exchange minimum"
-    assert -buys[0]["net_usd"] > cfg.stake_per_copy_usd * cfg.stake_schedule[0]
-    assert -buys[0]["net_usd"] <= cfg.stake_per_copy_usd + 1e-6
+    assert -buys[0]["net_usd"] > cap * cfg.stake_schedule[0]
+    assert -buys[0]["net_usd"] <= cap + 1e-6
 
 
 def test_fourth_fill_is_refused_with_a_budget_reason(db, cfg):
@@ -72,7 +93,7 @@ def test_fourth_fill_is_refused_with_a_budget_reason(db, cfg):
     assert reasons & {SkipReason.ALREADY_AT_MAX_COPIES.value,
                       SkipReason.TOKEN_BUDGET_SPENT.value}, \
         f"a refused 4th fill should cite the budget, got {reasons}"
-    assert spend(db) <= cfg.stake_per_copy_usd + 1e-6
+    assert spend(db) <= budget(s) + 1e-6
 
 
 def test_budget_is_remembered_across_a_restart(db, cfg, tmp_path):
@@ -92,7 +113,7 @@ def test_budget_is_remembered_across_a_restart(db, cfg, tmp_path):
     for i in range(5):
         s2.process_trades([make_trade(price=0.20, tx=f"0xb{i}", ts=1_787_000_010 + i)])
     total = sum(-e["net_usd"] for e in d2.recent_executions(50) if e["side"] == "BUY")
-    assert total <= cfg.stake_per_copy_usd + 1e-6
+    assert total <= budget(s2) + 1e-6
     d2.close()
 
 

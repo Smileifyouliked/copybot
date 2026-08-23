@@ -62,6 +62,65 @@ def render(cfg: Config, db: Database) -> str:
         out.append(f"  -> {winners['verdict']}")
     out.append("")
 
+    # ---- entry quality: the whole experiment ------------------------------
+    ratio = db.vwap_ratio_stats(breakeven=cfg.vwap_breakeven_ratio)
+    fills = db.fill_rate_stats()
+    out.append(rule("WHAT WE PAY COMPARED TO HIM"))
+    out.append(f"  break-even is {cfg.vwap_breakeven_ratio:.3f}x his price. Above that, his"
+               f" edge is spent")
+    out.append("  entirely on our entry and there is nothing left for us.")
+    if ratio["n"] == 0:
+        out.append("  No bets bought yet, so there is nothing to compare.")
+    else:
+        verdict = ("OVER THE LINE — at these prices he can keep picking winners "
+                   "and we still lose"
+                   if ratio["mean"] > cfg.vwap_breakeven_ratio
+                   else "inside the line — his edge still has room after our entry")
+        out.append(f"  we pay on average {ratio['mean']:.3f}x   typical bet "
+                   f"{ratio['median']:.3f}x   best {ratio['best']:.3f}x   "
+                   f"worst {ratio['worst']:.3f}x")
+        out.append(f"  {ratio['over_breakeven']} of {ratio['n']} bets are above the line "
+                   f"({100 * (ratio['over_breakeven_rate'] or 0):.0f}%)")
+        out.append(f"  -> {verdict}")
+    out.append("")
+
+    out.append(rule("ORDERS THAT ACTUALLY GOT FILLED"))
+    out.append("  We rest at his exact price and never chase. So the question is")
+    out.append("  not how much worse we paid, it is how often we got in at all.")
+    if fills["orders"] == 0:
+        out.append("  No orders have finished waiting yet.")
+    else:
+        out.append(f"  {fills['orders']} order(s) finished   "
+                   f"got some: {100 * fills['fill_rate']:.0f}%   "
+                   f"filled fully: {100 * fills['full_fill_rate']:.0f}%")
+        if fills["share_fill_rate"] is not None:
+            out.append(f"  of the shares we wanted, we got "
+                       f"{100 * fills['share_fill_rate']:.0f}%")
+        alt = fills["alt_fill_rate"]
+        if alt is not None:
+            gap = abs(alt - fills["fill_rate"])
+            out.append(f"  read the other way round: {100 * alt:.0f}%"
+                       + ("   <- THESE DISAGREE. One of them is counting the wrong"
+                          " trades; run side-check." if gap > 0.1
+                          else "   (the two readings agree)"))
+
+    variants = db.variant_breakdown(breakeven=cfg.vwap_breakeven_ratio)
+    if len(variants) > 1:
+        out.append("  by bet size — a resting order is held up by the queue in front")
+        out.append("  of it, not by how deep the book is, so a smaller bet can get in")
+        out.append("  more often. Compare these within a price band, not pooled:")
+        out.append("  size    orders   got some   of shares    bets   we pay")
+        for v in variants:
+            out.append(
+                f"  ${v['stake']:<5.2f} {v['orders']:>6}   "
+                + (f"{100 * v['fill_rate']:>7.0f}%" if v["fill_rate"] is not None else "      —")
+                + (f"   {100 * v['share_fill_rate']:>8.0f}%" if v["share_fill_rate"] is not None
+                   else "          —")
+                + f"   {v['positions']:>5}   "
+                + (f"{v['mean_ratio']:.3f}x" if v["mean_ratio"] is not None else "  —")
+            )
+    out.append("")
+
     # ---- health ----------------------------------------------------------
     heartbeat = db.last_heartbeat()
     age = (now - heartbeat["ts"]) if heartbeat else None

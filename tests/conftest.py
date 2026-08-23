@@ -46,10 +46,17 @@ def single_cfg(cfg):
     Tests about sells, settlement and marking predate follow-him-down and are
     not about it. Pinning the entry rules here keeps them testing the thing
     they were written to test, instead of silently becoming budget tests.
+
+    stake_variants_usd and entry_mode are pinned for the same reason: under the
+    shipped config the per-token budget depends on which variant the token
+    hashes to, and entries rest instead of crossing. Neither is what these
+    tests are about; test_limit_path.py and test_shipped_config.py cover the
+    shipped path directly.
     """
     return dataclasses.replace(
         cfg, max_entry_price=0.50, our_max_fill_price=0.50,
         shadow_band_max_price=0.50, max_copies_per_token=1, stake_schedule=[1.0],
+        stake_variants_usd=[3.00], entry_mode="market",
     )
 
 
@@ -81,10 +88,14 @@ class FakeExecutor:
     """Real fill simulation over books we control. Not a mock: the actual
     book-walking code runs, so these tests exercise fills.py too."""
 
-    def __init__(self, books=None, fee_rate=0.0):
+    def __init__(self, books=None, fee_rate=0.0, tape=None, ttl=300,
+                 exclude_wallet="0xhim"):
         self.books = books or {}
         self.fee = FeeModel(rate=fee_rate)
         self.calls = []
+        self.tape = tape or []
+        self.ttl = ttl
+        self.exclude_wallet = exclude_wallet
 
     def get_book(self, token_id):
         return self.books.get(token_id) or make_book(token_id=token_id)
@@ -100,6 +111,19 @@ class FakeExecutor:
         self.calls.append(("sell", token_id, shares))
         return simulate_sell(book, shares, self.fee, decision_ts=decision_ts,
                              max_book_lag_seconds=3600)
+
+    def place_limit(self, token_id, usd_amount, limit_price, *, book=None, now=0, **kw):
+        from copybot import limits
+        book = book if book is not None else self.get_book(token_id)
+        self.calls.append(("place_limit", token_id, usd_amount, limit_price))
+        return limits.place(book, limit_price, usd_amount, now=now,
+                            ttl_seconds=self.ttl, token_id=token_id, **kw)
+
+    def poll_limit(self, order, now):
+        from copybot import limits
+        return limits.apply_tape(order, self.tape, self.fee, now,
+                                 require_sell_prints=True,
+                                 exclude_wallet=self.exclude_wallet)
 
     def shadow_ladder(self, book, rungs, *, decision_ts=None):
         self.calls.append(("ladder", book.token_id, len(rungs)))

@@ -7,6 +7,8 @@
     python -m copybot.main export       # one bundle to hand an analyst
     python -m copybot.main side-check   # settle the tape's `side` convention
     python -m copybot.main status       # one-line state dump
+    python -m copybot.main archive      # copy this run's database aside
+    python -m copybot.main compare a.sqlite3 b.sqlite3   # entry quality, run vs run
 """
 from __future__ import annotations
 
@@ -21,7 +23,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="copybot")
     parser.add_argument("command",
                         choices=["run", "dashboard", "report", "export", "side-check",
-                                 "status"])
+                                 "status", "archive", "compare"])
+    parser.add_argument("paths", nargs="*",
+                        help="compare only: the run databases to compare")
     parser.add_argument("-c", "--config", default="config.yaml")
     parser.add_argument("--watch", action="store_true",
                         help="report only: redraw every --interval seconds")
@@ -36,9 +40,38 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.command == "run":
-        from .engine import build_engine, setup_logging
+        from .engine import AlreadyRunning, build_engine, setup_logging
         setup_logging(cfg)
-        build_engine(cfg).run()
+        try:
+            build_engine(cfg).run()
+        except AlreadyRunning as exc:
+            # Two writers on one database is how a copy gets counted twice.
+            # Refusing to start is the whole point, so say why and exit non-zero
+            # rather than logging a stack trace nobody reads.
+            print(f"refusing to start: {exc}", file=sys.stderr)
+            return 3
+        return 0
+
+    if args.command == "archive":
+        from .archive import archive
+        try:
+            dest = archive(cfg.db_path)
+        except (FileNotFoundError, FileExistsError) as exc:
+            print(f"archive failed: {exc}", file=sys.stderr)
+            return 2
+        print(f"archived {cfg.db_path} -> {dest}")
+        print("the original is untouched. To start a fresh run, move it aside "
+              "or point db_path at a new file -- never delete it.")
+        return 0
+
+    if args.command == "compare":
+        from .archive import compare
+        paths = args.paths or [cfg.db_path]
+        missing = [p for p in paths if not Path(p).exists()]
+        if missing:
+            print(f"no such database: {', '.join(missing)}", file=sys.stderr)
+            return 2
+        print(compare(paths, cfg.starting_capital_usd, cfg.vwap_breakeven_ratio))
         return 0
 
     if args.command == "dashboard":

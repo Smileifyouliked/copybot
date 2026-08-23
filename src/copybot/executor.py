@@ -11,9 +11,10 @@ from abc import ABC, abstractmethod
 
 from .config import LIVE_ENV_VARS, Config
 from .fees import FeeModel
+from . import limits
 from .fills import LadderRung, simulate_buy, simulate_sell, size_ladder
 from .models import FillResult, OrderBook
-from .polymarket import PolymarketClient
+from .polymarket import PolymarketClient, PolymarketError
 
 log = logging.getLogger(__name__)
 
@@ -36,6 +37,16 @@ class Executor(ABC):
     def shadow_ladder(self, book: OrderBook, rungs: list[tuple[str, float]], *,
                       decision_ts: int | None = None) -> list[LadderRung]:
         """Measurement only: never moves cash, never opens a position."""
+
+    @abstractmethod
+    def place_limit(self, token_id: str, usd_amount: float, limit_price: float, *,
+                    book: OrderBook | None = None, now: int = 0,
+                    **kw) -> "limits.RestingOrder":
+        """Rest a buy at `limit_price`. Never crosses the spread."""
+
+    @abstractmethod
+    def poll_limit(self, order: "limits.RestingOrder", now: int) -> "limits.RestingOrder":
+        """Advance a resting order against executed prints since it was placed."""
 
 
 class PaperExecutor(Executor):
@@ -110,6 +121,43 @@ class PaperExecutor(Executor):
         )
 
 
+    # -- limit orders ------------------------------------------------------
+    def place_limit(self, token_id: str, usd_amount: float, limit_price: float, *,
+                    book: OrderBook | None = None, now: int = 0,
+                    **kw) -> limits.RestingOrder:
+        book = book if book is not None else self.get_book(token_id)
+        return limits.place(book, limit_price, usd_amount, now=now,
+                            ttl_seconds=self.cfg.limit_order_ttl_seconds,
+                            token_id=token_id, **kw)
+
+    def poll_limit(self, order: limits.RestingOrder, now: int) -> limits.RestingOrder:
+        """Advance the order using the market's own executed trades.
+
+        The tape is the only honest source here. A quote at our price says
+        nothing about whether anyone traded, or about the queue ahead of us.
+        """
+        if not order.condition_id:
+            log.warning("resting order on %s carries no conditionId; cannot "
+                        "check the tape", order.token_id[:16])
+            return order
+        try:
+            trades = self.client.get_trades(order.condition_id, limit=200)
+        except PolymarketError as exc:
+            log.warning("tape fetch failed for %s: %s", order.condition_id[:12], exc)
+            return order
+        return limits.apply_tape(
+            order, trades, self._fee_for_condition(order.condition_id), now,
+            require_sell_prints=self.cfg.limit_fill_requires_sell_prints,
+            exclude_wallet=self.cfg.target_wallet,
+        )
+
+    def _fee_for_condition(self, condition_id: str) -> FeeModel:
+        rate, was_fallback = self.client.fee_rate_for(
+            condition_id, self.cfg.fee_rate_fallback)
+        return FeeModel(rate=rate, was_fallback=was_fallback,
+                        bps_override=self.cfg.fee_bps_override)
+
+
 class LiveExecutor(Executor):
     """Not implemented. Deliberately.
 
@@ -144,6 +192,13 @@ class LiveExecutor(Executor):
 
     def shadow_ladder(self, book: OrderBook, rungs, *,
                       decision_ts: int | None = None):  # pragma: no cover
+        raise NotImplementedError
+
+    def place_limit(self, token_id, usd_amount, limit_price, *, book=None,
+                    now=0, **kw):  # pragma: no cover
+        raise NotImplementedError
+
+    def poll_limit(self, order, now):  # pragma: no cover
         raise NotImplementedError
 
 

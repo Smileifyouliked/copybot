@@ -55,6 +55,14 @@
   .bar>span{display:block;height:100%;background:var(--accent)}
   .empty{color:var(--muted);font-style:italic;padding:8px 0}
   .scroll{overflow-x:auto}
+  .ratio-scale{margin:18px 0 0}
+  .ratio-track{position:relative;height:14px;background:var(--line);border-radius:7px;overflow:hidden}
+  .ratio-fill{display:block;height:100%;border-radius:7px 0 0 7px}
+  .ratio-fill.good{background:var(--up)}
+  .ratio-fill.bad{background:var(--down)}
+  .ratio-line{position:absolute;top:-4px;bottom:-4px;width:3px;background:var(--ink);
+              border-radius:2px;transform:translateX(-1px)}
+  .ratio-ends{display:flex;justify-content:space-between;margin-top:6px}
 </style>
 </head>
 <body>
@@ -92,6 +100,121 @@
         <span class="muted">— {{ winners.verdict }}</span>
       {% endif %}
     </p>
+  </div>
+
+  <!-- ============ entry quality: the whole experiment ============ -->
+  <div class="card">
+    <h2>What we pay compared to him</h2>
+    <p class="muted small" style="margin:-8px 0 14px">
+      We copy a wallet that makes money on cheap bets. Whether we make money too
+      comes down to one thing: the price we get versus the price he got. If we
+      pay <strong>{{ "%.1f"|format((cfg.vwap_breakeven_ratio - 1) * 100) }}% more
+      than he does</strong>, his entire edge is spent on our entry and there is
+      nothing left for us. That line does not move.
+    </p>
+
+    {% if ratio.n == 0 %}
+      <p class="empty">No bets bought yet, so there is nothing to compare.</p>
+    {% else %}
+    <div class="grid">
+      <div class="stat"><div class="l">We pay, on average</div>
+        <div class="v {{ 'down' if ratio_bar.over else 'up' }}">
+          {{ "%.3f"|format(ratio.mean) }}&times;</div></div>
+      <div class="stat"><div class="l">Break-even is</div>
+        <div class="v muted">{{ "%.3f"|format(ratio.breakeven) }}&times;</div></div>
+      <div class="stat"><div class="l">Typical bet</div>
+        <div class="v">{{ "%.3f"|format(ratio.median) }}&times;</div></div>
+      <div class="stat"><div class="l">Bets above the line</div>
+        <div class="v {{ 'down' if (ratio.over_breakeven_rate or 0) > 0.5 else '' }}">
+          {{ ratio.over_breakeven }} / {{ ratio.n }}</div></div>
+    </div>
+
+    <div class="ratio-scale">
+      <div class="ratio-track">
+        {% if ratio_bar.value_pct is not none %}
+        <span class="ratio-fill {{ 'bad' if ratio_bar.over else 'good' }}"
+              style="width:{{ "%.1f"|format(ratio_bar.value_pct) }}%"></span>
+        {% endif %}
+        <span class="ratio-line" style="left:{{ "%.1f"|format(ratio_bar.breakeven_pct) }}%"></span>
+      </div>
+      <div class="ratio-ends small muted">
+        <span>his price exactly</span>
+        <span>break-even {{ "%.3f"|format(ratio.breakeven) }}&times;</span>
+        <span>twice his price</span>
+      </div>
+    </div>
+
+    <p class="small" style="margin:14px 0 0">
+      {% if ratio_bar.over %}
+        <span class="down"><strong>We are paying more than the edge is worth.</strong></span>
+        On these prices the wallet can keep picking winners and we still lose.
+      {% else %}
+        <span class="up"><strong>We are inside the line.</strong></span>
+        At these prices his edge still has room left in it after our entry.
+      {% endif %}
+      Best bet {{ "%.3f"|format(ratio.best) }}&times;, worst {{ "%.3f"|format(ratio.worst) }}&times;.
+    </p>
+    {% endif %}
+
+    <h3>Orders that actually got filled</h3>
+    <p class="muted small" style="margin:0 0 12px">
+      We place our order at his exact price and wait. It either fills at that
+      price or it does not fill at all — we never chase. So the question is not
+      "how much worse did we pay", it is "how often did we get in".
+    </p>
+    {% if fills.orders == 0 %}
+      <p class="empty">No orders have finished waiting yet.</p>
+    {% else %}
+    <div class="grid">
+      <div class="stat"><div class="l">Orders placed</div>
+        <div class="v">{{ fills.orders }}</div></div>
+      <div class="stat"><div class="l">Got at least some</div>
+        <div class="v">{{ "%.0f"|format(100 * fills.fill_rate) }}%</div></div>
+      <div class="stat"><div class="l">Filled completely</div>
+        <div class="v">{{ "%.0f"|format(100 * fills.full_fill_rate) }}%</div></div>
+      <div class="stat"><div class="l">Of the shares we wanted</div>
+        <div class="v">{{ "%.0f"|format(100 * fills.share_fill_rate) if fills.share_fill_rate is not none else "—" }}%</div></div>
+    </div>
+    <p class="small {{ 'warn' if fills_diverge else 'muted' }}" style="margin:12px 0 0">
+      Read the other way round, the same orders fill
+      {{ "%.0f"|format(100 * fills.alt_fill_rate) if fills.alt_fill_rate is not none else "—" }}% of the time.
+      {% if fills_diverge %}
+        <strong>These two disagree.</strong> They are not two guesses at one
+        number — one of them is counting the wrong trades. Run
+        <code>side-check</code> before trusting either.
+      {% else %}
+        The two readings agree, so this number does not depend on which one is right.
+      {% endif %}
+    </p>
+    {% endif %}
+
+    {% if variants|length > 1 %}
+    <h3>Does a smaller bet get in more often?</h3>
+    <p class="muted small" style="margin:0 0 12px">
+      A waiting order is held up by the queue in front of it, not by how deep
+      the market is — so a smaller bet can get filled more often at the same
+      price. Each market is assigned one bet size and keeps it. Compare these
+      within a price range, not pooled: below 20c a $1 order is too small to
+      place at all, so the sizes do not see the same markets.
+    </p>
+    <div class="scroll">
+    <table>
+      <tr><th>Bet size</th><th class="num">Orders</th><th class="num">Got some</th>
+          <th class="num">Of shares wanted</th><th class="num">Bets</th>
+          <th class="num">We pay</th></tr>
+      {% for v in variants %}
+      <tr>
+        <td>{{ money(v.stake) }}</td>
+        <td class="num">{{ v.orders }}</td>
+        <td class="num">{{ "%.0f"|format(100 * v.fill_rate) ~ "%" if v.fill_rate is not none else "—" }}</td>
+        <td class="num">{{ "%.0f"|format(100 * v.share_fill_rate) ~ "%" if v.share_fill_rate is not none else "—" }}</td>
+        <td class="num">{{ v.positions }}</td>
+        <td class="num">{{ "%.3f"|format(v.mean_ratio) ~ "&times;"|safe if v.mean_ratio is not none else "—" }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    </div>
+    {% endif %}
   </div>
 
   <!-- ============ status ============ -->
