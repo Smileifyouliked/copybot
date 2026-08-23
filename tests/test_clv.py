@@ -18,22 +18,22 @@ def deep():
     return {"TOK1": make_book(asks=[(0.20, 10_000)], bids=[(0.19, 10_000)])}
 
 
-def build(db, cfg, books=None, metas=None, now=1_787_000_000):
+def build(db, single_cfg, books=None, metas=None, now=1_787_000_000):
     ex = FakeExecutor(books=books)
     cl = FakeClient(books=books, metas=metas)
-    return Strategy(cfg, db, ex, cl, clock=lambda: now), ex, cl
+    return Strategy(single_cfg, db, ex, cl, clock=lambda: now), ex, cl
 
 
-def open_one(db, cfg, books=None, metas=None, now=1_787_000_000):
+def open_one(db, single_cfg, books=None, metas=None, now=1_787_000_000):
     books = deep() if books is None else books
-    s, ex, cl = build(db, cfg, books=books, metas=metas or {"0xcond1": make_meta()}, now=now)
+    s, ex, cl = build(db, single_cfg, books=books, metas=metas or {"0xcond1": make_meta()}, now=now)
     s.process_trades([make_trade(price=0.20, ts=now)])
     return s, cl, db.open_positions()[0]["id"]
 
 
-def test_marking_captures_bid_ask_and_spread(db, cfg):
+def test_marking_captures_bid_ask_and_spread(db, single_cfg):
     books = {"TOK1": make_book(asks=[(0.30, 500)], bids=[(0.24, 500)])}
-    s, cl, pos_id = open_one(db, cfg, books=books)
+    s, cl, pos_id = open_one(db, single_cfg, books=books)
     s.mark_positions()
     pos = db.get_position(pos_id)
     assert pos["last_mark_source"] == MarkSource.BOOK_MID.value
@@ -45,8 +45,8 @@ def test_marking_captures_bid_ask_and_spread(db, cfg):
     assert pos["closing_line_spread"] == pytest.approx(0.06)
 
 
-def test_empty_book_falls_back_to_gamma_never_to_zero(db, cfg):
-    s, cl, pos_id = open_one(db, cfg)
+def test_empty_book_falls_back_to_gamma_never_to_zero(db, single_cfg):
+    s, cl, pos_id = open_one(db, single_cfg)
     cl.books["TOK1"] = make_book(asks=[], bids=[])
     cl.metas["0xcond1"] = make_meta(prices=(0.42, 0.58))
     s.mark_positions()
@@ -55,11 +55,11 @@ def test_empty_book_falls_back_to_gamma_never_to_zero(db, cfg):
     assert pos["last_mark_price"] == pytest.approx(0.42)
 
 
-def test_gamma_price_never_becomes_the_closing_line(db, cfg):
+def test_gamma_price_never_becomes_the_closing_line(db, single_cfg):
     """A resolved market's gamma price is 0 or 1 -- that is the outcome, not a
     line. Using it would make CLV a restatement of the result."""
     books = {"TOK1": make_book(asks=[(0.30, 500)], bids=[(0.24, 500)])}
-    s, cl, pos_id = open_one(db, cfg, books=books)
+    s, cl, pos_id = open_one(db, single_cfg, books=books)
     s.mark_positions()  # good book capture -> closing line 0.27
 
     cl.books["TOK1"] = make_book(asks=[], bids=[])
@@ -71,8 +71,8 @@ def test_gamma_price_never_becomes_the_closing_line(db, cfg):
     assert pos["closing_line_price"] == pytest.approx(0.27), "closing line must not follow gamma"
 
 
-def test_everything_empty_falls_back_to_last_known_then_entry(db, cfg):
-    s, cl, pos_id = open_one(db, cfg)
+def test_everything_empty_falls_back_to_last_known_then_entry(db, single_cfg):
+    s, cl, pos_id = open_one(db, single_cfg)
     cl.books["TOK1"] = make_book(asks=[], bids=[])
     cl.metas = {}
     s.mark_positions()
@@ -82,12 +82,12 @@ def test_everything_empty_falls_back_to_last_known_then_entry(db, cfg):
     assert pos["last_mark_source"] in (MarkSource.LAST_KNOWN.value, MarkSource.ENTRY_PRICE.value)
 
 
-def test_clv_is_frozen_at_resolution_with_its_age(db, cfg):
+def test_clv_is_frozen_at_resolution_with_its_age(db, single_cfg):
     books = {"TOK1": make_book(asks=[(0.20, 10_000)], bids=[(0.19, 10_000)])}
-    s, cl, pos_id = open_one(db, cfg, books=books, now=1_787_000_000)
+    s, cl, pos_id = open_one(db, single_cfg, books=books, now=1_787_000_000)
     s.mark_positions()
 
-    later = Strategy(cfg, db, s.executor, cl, clock=lambda: 1_787_000_900)
+    later = Strategy(single_cfg, db, s.executor, cl, clock=lambda: 1_787_000_900)
     cl.books["TOK1"] = make_book(asks=[], bids=[])
     cl.metas["0xcond1"] = make_meta(prices=(1.0, 0.0), closed=True)
     later.check_resolutions()
@@ -99,10 +99,10 @@ def test_clv_is_frozen_at_resolution_with_its_age(db, cfg):
     assert pos["closing_line_age_seconds"] == 900
 
 
-def test_capture_failure_is_counted_not_hidden(db, cfg):
+def test_capture_failure_is_counted_not_hidden(db, single_cfg):
     """A position that resolves before any successful book mark has no closing
     line. That must show up as a failure, not as a silent zero."""
-    s, cl, pos_id = open_one(db, cfg)
+    s, cl, pos_id = open_one(db, single_cfg)
     cl.books["TOK1"] = make_book(asks=[], bids=[])
     cl.metas["0xcond1"] = make_meta(prices=(1.0, 0.0), closed=True)
     s.check_resolutions()
@@ -110,26 +110,26 @@ def test_capture_failure_is_counted_not_hidden(db, cfg):
     pos = db.get_position(pos_id)
     assert pos["closing_line_captured"] == 0
     assert pos["clv_pct"] is None
-    summary = clv_summary(db, cfg.clv_max_spread)
+    summary = clv_summary(db, single_cfg.clv_max_spread)
     assert summary["failures"] == 1
     assert summary["capture_rate"] == 0.0
 
 
-def test_wide_spread_captures_are_separated_from_clean_ones(db, cfg):
+def test_wide_spread_captures_are_separated_from_clean_ones(db, single_cfg):
     books = {"TOK1": make_book(asks=[(0.50, 500)], bids=[(0.05, 500)])}  # 45c spread
-    s, cl, pos_id = open_one(db, cfg, books=books)
+    s, cl, pos_id = open_one(db, single_cfg, books=books)
     s.mark_positions()
     cl.metas["0xcond1"] = make_meta(prices=(1.0, 0.0), closed=True)
     cl.books["TOK1"] = make_book(asks=[], bids=[])
     s.check_resolutions()
 
-    summary = clv_summary(db, cfg.clv_max_spread)
+    summary = clv_summary(db, single_cfg.clv_max_spread)
     assert summary["captured"] == 1
     assert summary["wide_spread"] == 1
     assert summary["clean"] == 0
 
 
-def test_near_close_tightens_the_marking_interval(db, cfg):
+def test_near_close_tightens_the_marking_interval(db, single_cfg):
     import datetime
 
     now = 1_787_000_000  # 2026-08-17T20:53:20Z
@@ -140,20 +140,20 @@ def test_near_close_tightens_the_marking_interval(db, cfg):
         ).isoformat().replace("+00:00", "Z")
 
     metas = {"0xcond1": make_meta(end_date=iso(-600))}  # already past
-    s, _, cl = build(db, cfg, books=deep(), metas=metas, now=now)
+    s, _, cl = build(db, single_cfg, books=deep(), metas=metas, now=now)
     s.process_trades([make_trade(price=0.20, ts=now)])
-    assert s.next_mark_interval() == cfg.mark_interval_seconds
+    assert s.next_mark_interval() == single_cfg.mark_interval_seconds
 
     cl.metas["0xcond1"] = make_meta(end_date=iso(600))  # 10 min out -> tighten
-    assert s.next_mark_interval() == cfg.mark_interval_near_close_seconds
+    assert s.next_mark_interval() == single_cfg.mark_interval_near_close_seconds
 
     cl.metas["0xcond1"] = make_meta(end_date=iso(5 * 86400))  # days out
-    assert s.next_mark_interval() == cfg.mark_interval_seconds
+    assert s.next_mark_interval() == single_cfg.mark_interval_seconds
 
 
 # --- Expected vs actual winners -------------------------------------------
 
-def test_expected_winners_is_the_sum_of_entry_prices(db, cfg):
+def test_expected_winners_is_the_sum_of_entry_prices(db, single_cfg):
     """Under the null, a copy entered at 5c wins 5% of the time."""
     with db.tx() as conn:
         for i in range(60):
@@ -175,7 +175,7 @@ def test_expected_winners_is_the_sum_of_entry_prices(db, cfg):
     assert "too early" in stats["verdict"]
 
 
-def test_four_winners_out_of_sixty_is_still_noise(db, cfg):
+def test_four_winners_out_of_sixty_is_still_noise(db, single_cfg):
     """A real edge would show ~4. That must NOT read as success."""
     with db.tx() as conn:
         for i in range(60):
@@ -192,13 +192,13 @@ def test_four_winners_out_of_sixty_is_still_noise(db, cfg):
     assert "noise" in stats["verdict"] or "too early" in stats["verdict"]
 
 
-def test_no_resolved_bets_reports_cleanly(db, cfg):
+def test_no_resolved_bets_reports_cleanly(db, single_cfg):
     stats = expected_vs_actual_winners(db)
     assert stats["resolved"] == 0
     assert stats["verdict"] == "no resolved bets yet"
 
 
-def test_exit_path_breakdown_separates_the_two_products(db, cfg):
+def test_exit_path_breakdown_separates_the_two_products(db, single_cfg):
     with db.tx() as conn:
         db.insert_position(conn, token_id="A", condition_id="0xc", question="Q",
                            outcome="Yes", outcome_index=0, status="closed", opened_ts=1,

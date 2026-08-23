@@ -141,32 +141,72 @@ class Strategy:
         )
 
         copies = self.db.count_copies_for_token(trade.token_id)
-        if copies >= self.cfg.max_copies_per_token:
+        spent = self.db.spent_on_token(trade.token_id)
+        budget = self.cfg.stake_per_copy_usd
+        remaining = budget - spent
+
+        if copies < self.cfg.max_copies_per_token and remaining > 0.01:
+            # Follow him down. He averages ~5 fills per token and lands well
+            # below his opener, so taking only his first fill makes his VWAP
+            # unreachable by construction. The schedule splits one budget across
+            # his successive fills; it never adds a second budget.
+            share = self.cfg.stake_schedule[min(copies, len(self.cfg.stake_schedule) - 1)]
+            stake = min(budget * share, remaining)
+            # The schedule and the exchange floor pull against each other: at
+            # 29c a $1.02 tranche buys 3.5 shares, under the 5-share minimum,
+            # so the whole tranche would be unplaceable. Size up to whatever
+            # clears the floor -- spending the budget in fewer, larger pieces
+            # rather than in pieces that cannot be placed at all -- and never
+            # past the remaining budget.
+            if self.cfg.respect_min_order_size and trade.price > 0:
+                floor_usd = book.min_order_size * trade.price * 1.05
+                stake = min(max(stake, floor_usd), remaining)
+                # If what would be left over is itself too small to place, it
+                # can never be spent and would sit stranded for the life of the
+                # position. Absorb it now instead.
+                leftover = remaining - stake
+                if 0 < leftover < floor_usd:
+                    stake = remaining
+        else:
+            stake = 0.0
+
+        if stake <= 0.01:
+            reason = (SkipReason.ALREADY_AT_MAX_COPIES
+                      if copies >= self.cfg.max_copies_per_token
+                      else SkipReason.TOKEN_BUDGET_SPENT)
             # We are not copying this fill, but he is still scaling in. His
             # average entry keeps improving while ours is frozen, and that gap
             # is the whole point of tracking it -- so record the fill and
             # refresh the position's view of his side before skipping.
             self._skip(
-                trade, SkipReason.ALREADY_AT_MAX_COPIES, counters,
-                f"already hold {copies} copy/copies of this token "
-                f"(max {self.cfg.max_copies_per_token})",
+                trade, reason, counters,
+                f"already put ${spent:.2f} of the ${budget:.2f} per-token budget "
+                f"into this token across {copies} fill(s)",
                 book=book, rungs=rungs,
             )
             self._refresh_his_position(trade.token_id)
             return
 
+        # The cap is absolute. If this ever trips, the ledger and the gate
+        # disagree and no further money should go in on a guess.
+        if spent + stake > budget + 1e-6:
+            raise AssertionError(
+                f"per-token budget breach on {trade.token_id[:16]}: already "
+                f"${spent:.4f} + ${stake:.4f} exceeds ${budget:.4f}"
+            )
+
         cash = self.db.cash()
-        if cash < self.cfg.stake_per_copy_usd:
+        if cash < stake:
             return self._skip(
                 trade, SkipReason.NOT_ENOUGH_CASH, counters,
-                f"free cash ${cash:.2f} is below the ${self.cfg.stake_per_copy_usd:.2f} stake",
+                f"free cash ${cash:.2f} is below the ${stake:.2f} needed for this fill",
                 book=book, rungs=rungs,
             )
 
         # The real decision uses the SAME snapshot the ladder was measured on,
         # so the two are directly comparable and no second fetch can slip a
         # different (possibly better) book into the fill.
-        fill = self.executor.buy(trade.token_id, self.cfg.stake_per_copy_usd,
+        fill = self.executor.buy(trade.token_id, stake,
                                  book=book, decision_ts=decision_ts)
         if not fill.filled:
             return self._skip(
@@ -189,8 +229,6 @@ class Strategy:
 
             slip_vwap = fill.avg_price - his_vwap
             slip_vwap_pct = (slip_vwap / his_vwap * 100.0) if his_vwap > 0 else 0.0
-            stake = self.cfg.stake_per_copy_usd
-
             position_id = self.db.insert_position(
                 conn,
                 token_id=trade.token_id, condition_id=trade.condition_id,
@@ -247,7 +285,7 @@ class Strategy:
         counters.copied += 1
         log.info("BUY  $%.2f -> %.4f shares @ %.4f (he paid %.4f, %+.1f%%, "
                  "%d level(s), %ds late) %s",
-                 self.cfg.stake_per_copy_usd, fill.shares, fill.avg_price,
+                 stake, fill.shares, fill.avg_price,
                  trade.price, slip_pct, fill.levels_consumed, latency,
                  trade.title[:44])
         if slip_pct > self.cfg.slippage_warn_pct:

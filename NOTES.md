@@ -558,12 +558,35 @@ renders current standing against each threshold; the numbers live in
 **Do not loosen these mid-experiment.** If a threshold turns out to be wrong,
 that is a finding to write down here, not an edit to make quietly.
 
+### The headline metric: our VWAP ÷ his VWAP
+
+His sub-50c book returns **+41.3% net of full taker fees** (+47.5% gross; the
+API's `usdcSize` is `size x price` and excludes fees). We buy the same outcome,
+so the only thing that separates our result from his is the price we pay.
+
+    break-even = our VWAP / his VWAP = 1.395
+
+Above 1.395 we lose money on a confirmed edge. Below it we make money. This
+ratio is the dashboard's headline entry-quality number, with 1.395 drawn as a
+hard line, and it replaces single-fill slippage as the metric that matters.
+
+| our entry vs his | our net return |
+|---|---|
+| 1.00x | +41.3% |
+| 1.20x | +17.8% |
+| **1.395x** | **0%** |
+| 1.78x | -20.6% |
+| 2.97x | -52.4% |
+
 ### Kill conditions — any one of these ends the project
 
 * **Depth, $3:** after 50+ signals with valid ladder rows, if median depth cost
   at $3 exceeds 25%, $3 is not viable. Retest at $1 before killing outright.
 * **Depth, $1:** if median depth cost at $1 also exceeds 25% across 50+
   signals, the strategy is unreachable at any size I'd trade. Kill.
+* **Entry quality:** after 50 filled copies, if median (our VWAP / his VWAP)
+  exceeds **1.395**, limit orders did not solve the problem and the strategy is
+  unreachable at our execution quality. Kill.
 * **CLV:** after 100 copies, if median CLV at the +60min horizon is negative,
   kill regardless of P&L.
 * **Metric integrity:** if closing-line capture failure exceeds 30%, stop and
@@ -589,6 +612,22 @@ Meanwhile at his own size he pays near zero.
 
 If that holds, his edge is not copyable at our size and no amount of tuning
 fixes it. That is why the ladder has an assertion rather than a warning.
+
+### Expected shape of the equity curve
+
+Two reasons it will look worse than his, both structural rather than faults:
+
+1. **He hedges about a quarter of the time.** 676 of his events carry both a
+   sub-50c leg and a 90c+ leg on the same city-day, and **28.4% of his sub-50c
+   money sits inside those hedged events**. We copy only the cheap leg. On that
+   quarter he collects the favourite's payout when the tail misses and we do
+   not, so our variance is strictly higher than his on the same picks.
+2. **The cheap end wins rarely and large.** The 0-10c band wins 5.6% of the
+   time at +62.5% gross return.
+
+Expect long red stretches punctuated by rare large wins. **That is the
+expected shape, not a malfunction.** It is also why the P&L verdict needs 700
+resolved copies and why entry quality and CLV are judged first.
 
 ### How "no crash or stall" is measured
 

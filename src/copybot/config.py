@@ -63,6 +63,16 @@ class Config:
     shadow_ladder_usd: list
     shadow_ladder_include_his_sizes: bool
     clv_horizons_minutes: list
+    shadow_band_max_price: float
+    entry_mode: str
+    limit_order_ttl_seconds: int
+    limit_queue_model: str
+    limit_fill_requires_sell_prints: bool
+    stake_schedule: list
+    stake_variants_usd: list
+    vwap_breakeven_ratio: float
+    kill_vwap_ratio: float
+    kill_vwap_min_fills: int
     kill_depth_cost_pct: float
     kill_depth_min_signals: int
     kill_clv_min_copies: int
@@ -122,6 +132,16 @@ _DEFAULTS: dict[str, Any] = {
     "shadow_ladder_usd": [1.00, 3.00, 10.00],
     "shadow_ladder_include_his_sizes": True,
     "clv_horizons_minutes": [15, 60, 360],
+    "shadow_band_max_price": 0.50,
+    "entry_mode": "market",
+    "limit_order_ttl_seconds": 300,
+    "limit_queue_model": "back",
+    "limit_fill_requires_sell_prints": True,
+    "stake_schedule": [0.34, 0.33, 0.33],
+    "stake_variants_usd": [1.00, 2.00, 3.00],
+    "vwap_breakeven_ratio": 1.395,
+    "kill_vwap_ratio": 1.395,
+    "kill_vwap_min_fills": 50,
     "kill_depth_cost_pct": 25.0,
     "kill_depth_min_signals": 50,
     "kill_clv_min_copies": 100,
@@ -219,6 +239,39 @@ def _validate(cfg: Config) -> None:
     ):
         if getattr(cfg, name) <= 0:
             raise ConfigError(f"{name} must be > 0")
+
+    if cfg.entry_mode not in ("limit", "market"):
+        raise ConfigError(f"entry_mode must be 'limit' or 'market', got {cfg.entry_mode!r}")
+    if cfg.entry_mode == "limit":
+        raise ConfigError(
+            "entry_mode: limit is not wired into the buy path yet. limits.py "
+            "implements and tests the resting-order model, but strategy.py "
+            "still crosses the spread, so running in limit mode would silently "
+            "market-buy. Leave it on 'market' until the wiring lands."
+        )
+    if cfg.limit_queue_model not in ("back", "front"):
+        raise ConfigError(f"limit_queue_model must be 'back' or 'front', got "
+                          f"{cfg.limit_queue_model!r}")
+    if cfg.limit_order_ttl_seconds <= 0:
+        raise ConfigError("limit_order_ttl_seconds must be > 0")
+    if not cfg.stake_schedule or any(f <= 0 for f in cfg.stake_schedule):
+        raise ConfigError("stake_schedule must be a non-empty list of positive fractions")
+    if abs(sum(cfg.stake_schedule) - 1.0) > 1e-6:
+        raise ConfigError(
+            f"stake_schedule must sum to exactly 1.0, got {sum(cfg.stake_schedule)}. "
+            "The per-token budget is a hard cap."
+        )
+    if cfg.max_copies_per_token > len(cfg.stake_schedule):
+        raise ConfigError(
+            f"max_copies_per_token ({cfg.max_copies_per_token}) exceeds the "
+            f"{len(cfg.stake_schedule)} entries in stake_schedule"
+        )
+    if not cfg.stake_variants_usd or any(v <= 0 for v in cfg.stake_variants_usd):
+        raise ConfigError("stake_variants_usd must be a non-empty list of positive amounts")
+    if cfg.shadow_band_max_price < cfg.max_entry_price:
+        raise ConfigError("shadow_band_max_price must be >= max_entry_price")
+    if cfg.vwap_breakeven_ratio <= 1.0:
+        raise ConfigError("vwap_breakeven_ratio must be > 1.0")
 
     if not cfg.shadow_ladder_usd or any(v <= 0 for v in cfg.shadow_ladder_usd):
         raise ConfigError("shadow_ladder_usd must be a non-empty list of positive amounts")

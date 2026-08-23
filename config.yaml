@@ -8,9 +8,37 @@ target_wallet: "0x6297b93ea37ff92a57fd636410f3b71ebf74517e"
 starting_capital_usd: 150.00
 stake_per_copy_usd: 3.00
 
-max_entry_price: 0.50          # only copy his buys below this
-our_max_fill_price: 0.50       # our own fill must also be under this, or skip
-max_copies_per_token: 1        # don't stack $3 repeatedly into one market
+# His 30-50c band returned +9.3% gross, roughly zero after his own fees, while
+# consuming 18% of sub-50c capital. Cut from the traded universe -- but still
+# recorded as shadow rows up to shadow_band_max_price, so the band's behaviour
+# at our fill prices is measured rather than left as a gap.
+max_entry_price: 0.30
+shadow_band_max_price: 0.50
+our_max_fill_price: 0.30       # our own fill must also be under this, or skip
+
+# --- Entry mode -------------------------------------------------------------
+# "market" crosses the spread ~15s behind him and pays 11-197% worse on his own
+# picks. "limit" rests at his exact fill price and either fills or does not.
+# Break-even is our VWAP / his VWAP = 1.395 (see NOTES.md S10), so entry quality
+# is the whole experiment and fill rate is the number that decides it.
+# NOT YET WIRED into the strategy -- the resting-order model in limits.py is
+# built and tested, but the buy path still crosses the spread. Left on "market"
+# so this file describes what the code actually does. Flip to "limit" in the
+# same commit that wires it.
+entry_mode: "market"           # "limit" | "market"
+limit_order_ttl_seconds: 300   # how long an order rests before being cancelled
+limit_queue_model: "back"      # "back" = assume we join behind all resting size
+# Only seller-initiated prints consume our resting bid. The tape's `side`
+# convention could not be pinned down decisively, so this errs conservative:
+# correct if `side` is the taker's, merely under-counting fills if it is not.
+limit_fill_requires_sell_prints: true
+
+# Following him down: he averages ~5 fills per token and lands well below his
+# opener. Taking only his first fill makes his VWAP structurally unreachable.
+# The schedule splits the per-token budget across his successive fills.
+# Total per token never exceeds stake_per_copy_usd, no exceptions.
+stake_schedule: [0.34, 0.33, 0.33]
+max_copies_per_token: 3        # must not exceed len(stake_schedule)
 max_trade_age_seconds: 300     # don't copy stale trades after downtime
 poll_interval_seconds: 15
 activity_fetch_limit: 100     # rows per poll; he trades ~60/day so this is ample
@@ -68,6 +96,12 @@ max_book_lag_seconds: 2
 # at any size? The rung at his own size says whether his edge is real or an
 # artifact of being small enough not to move the book.
 shadow_ladder_usd: [1.00, 3.00, 10.00]
+
+# Resting orders punish size through queue position rather than depth, so a
+# smaller order may fill far more often. Each new token is assigned a stake
+# variant round-robin, and fill rate and VWAP ratio are tracked per variant.
+# Set to a single value to disable the experiment.
+stake_variants_usd: [1.00, 2.00, 3.00]
 shadow_ladder_include_his_sizes: true
 
 # CLV is also computed at fixed horizons after entry, not only at close. Fixed
@@ -79,6 +113,11 @@ clv_horizons_minutes: [15, 60, 360]
 # Fixed while neutral, on purpose, so it cannot be renegotiated at week three
 # while down money and hopeful. The full text is in NOTES.md; these are the
 # numbers the dashboard checks against. Do not loosen them mid-experiment.
+# Break-even on his +41.3% net edge. Above it we lose money on a real edge.
+vwap_breakeven_ratio: 1.395
+kill_vwap_ratio: 1.395           # median our-VWAP / his-VWAP above this kills it
+kill_vwap_min_fills: 50          # ...once this many copies have actually filled
+
 kill_depth_cost_pct: 25.0        # median depth cost above this kills that size
 kill_depth_min_signals: 50       # ...but only once this many paired signals exist
 kill_clv_min_copies: 100         # CLV verdict needs this many copies

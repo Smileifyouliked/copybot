@@ -76,10 +76,10 @@ def test_ladder_on_an_empty_book_does_not_crash():
     assert all(r.depth_cost_pct is None for r in rungs)
 
 
-def test_ladder_never_touches_cash_or_positions(db, cfg):
+def test_ladder_never_touches_cash_or_positions(db, single_cfg):
     ex = FakeExecutor(books={"TOK1": book(asks=[(0.20, 10_000)], bids=[(0.19, 10_000)])})
     cl = FakeClient(metas={"0xcond1": make_meta()})
-    s = Strategy(cfg, db, ex, cl, clock=lambda: 1_787_000_000)
+    s = Strategy(single_cfg, db, ex, cl, clock=lambda: 1_787_000_000)
     before = db.cash()
     s.process_trades([make_trade(price=0.20, ts=1_787_000_000)])
     # One copy happened, so cash moved by exactly one stake and no more.
@@ -90,11 +90,11 @@ def test_ladder_never_touches_cash_or_positions(db, cfg):
 
 # --- Ladder recorded on skips too ------------------------------------------
 
-def test_ladder_is_recorded_even_when_we_skip(db, cfg):
+def test_ladder_is_recorded_even_when_we_skip(db, single_cfg):
     """A skip is exactly when the capacity curve matters most."""
     ex = FakeExecutor(books={"TOK1": book(asks=[(0.60, 10_000)], bids=[(0.59, 10_000)])})
     cl = FakeClient(metas={"0xcond1": make_meta()})
-    s = Strategy(cfg, db, ex, cl, clock=lambda: 1_787_000_000)
+    s = Strategy(single_cfg, db, ex, cl, clock=lambda: 1_787_000_000)
     s.process_trades([make_trade(price=0.05, ts=1_787_000_000)])
 
     assert db.open_positions() == []
@@ -105,10 +105,10 @@ def test_ladder_is_recorded_even_when_we_skip(db, cfg):
     assert all(r["cleared_max_fill"] == 0 for r in rows)
 
 
-def test_his_own_size_is_a_rung(db, cfg):
+def test_his_own_size_is_a_rung(db, single_cfg):
     ex = FakeExecutor(books={"TOK1": book(asks=[(0.20, 10_000)], bids=[(0.19, 10_000)])})
     cl = FakeClient(metas={"0xcond1": make_meta()})
-    s = Strategy(cfg, db, ex, cl, clock=lambda: 1_787_000_000)
+    s = Strategy(single_cfg, db, ex, cl, clock=lambda: 1_787_000_000)
     s.process_trades([make_trade(price=0.20, shares=10.0, ts=1_787_000_000)])  # $2.00
     labels = {r["rung_label"] for r in
               db.conn.execute("SELECT DISTINCT rung_label FROM shadow_fills")}
@@ -118,11 +118,11 @@ def test_his_own_size_is_a_rung(db, cfg):
     assert his["rung_usd"] == pytest.approx(2.00)
 
 
-def test_capacity_curve_rolls_the_rungs_up(db, cfg):
+def test_capacity_curve_rolls_the_rungs_up(db, single_cfg):
     ex = FakeExecutor(books={"TOK1": book(asks=[(0.05, 40), (0.40, 10_000)],
                                           bids=[(0.04, 500)])})
     cl = FakeClient(metas={"0xcond1": make_meta()})
-    s = Strategy(cfg, db, ex, cl, clock=lambda: 1_787_000_000)
+    s = Strategy(single_cfg, db, ex, cl, clock=lambda: 1_787_000_000)
     s.process_trades([make_trade(price=0.05, ts=1_787_000_000)])
 
     curve = {r["rung"]: r for r in capacity_curve(db)}
@@ -132,11 +132,11 @@ def test_capacity_curve_rolls_the_rungs_up(db, cfg):
     assert curve["$1"]["clear_rate"] == 1.0
 
 
-def test_depth_cost_summary_buckets(db, cfg):
+def test_depth_cost_summary_buckets(db, single_cfg):
     ex = FakeExecutor(books={"TOK1": book(asks=[(0.05, 40), (0.40, 10_000)],
                                           bids=[(0.04, 500)])})
     cl = FakeClient(metas={"0xcond1": make_meta()})
-    s = Strategy(cfg, db, ex, cl, clock=lambda: 1_787_000_000)
+    s = Strategy(single_cfg, db, ex, cl, clock=lambda: 1_787_000_000)
     s.process_trades([make_trade(price=0.05, ts=1_787_000_000)])
     summary = depth_cost_summary(db, "$3")
     assert summary["n"] == 1
@@ -146,16 +146,16 @@ def test_depth_cost_summary_buckets(db, cfg):
 
 # --- Full mark path --------------------------------------------------------
 
-def test_every_mark_is_its_own_row(db, cfg):
+def test_every_mark_is_its_own_row(db, single_cfg):
     books = {"TOK1": book(asks=[(0.20, 10_000)], bids=[(0.19, 10_000)])}
     ex = FakeExecutor(books=books)
     cl = FakeClient(books=books, metas={"0xcond1": make_meta()})
-    s = Strategy(cfg, db, ex, cl, clock=lambda: 1_787_000_000)
+    s = Strategy(single_cfg, db, ex, cl, clock=lambda: 1_787_000_000)
     s.process_trades([make_trade(price=0.20, ts=1_787_000_000)])
     pos_id = db.open_positions()[0]["id"]
 
     for offset in (300, 600, 900):
-        Strategy(cfg, db, ex, cl, clock=lambda o=offset: 1_787_000_000 + o).mark_positions()
+        Strategy(single_cfg, db, ex, cl, clock=lambda o=offset: 1_787_000_000 + o).mark_positions()
 
     marks = db.marks_for(pos_id)
     assert len(marks) == 4  # entry + three marks
@@ -165,16 +165,16 @@ def test_every_mark_is_its_own_row(db, cfg):
     assert marks[-1]["spread"] == pytest.approx(0.01)
 
 
-def test_clv_at_horizons_uses_the_mark_path(db, cfg):
+def test_clv_at_horizons_uses_the_mark_path(db, single_cfg):
     books = {"TOK1": book(asks=[(0.20, 10_000)], bids=[(0.19, 10_000)])}
     ex = FakeExecutor(books=books)
     cl = FakeClient(books=books, metas={"0xcond1": make_meta()})
-    s = Strategy(cfg, db, ex, cl, clock=lambda: 1_787_000_000)
+    s = Strategy(single_cfg, db, ex, cl, clock=lambda: 1_787_000_000)
     s.process_trades([make_trade(price=0.20, ts=1_787_000_000)])
 
     # Price drifts up; mark at roughly entry + 15 minutes.
     cl.books["TOK1"] = book(asks=[(0.30, 10_000)], bids=[(0.28, 10_000)])
-    Strategy(cfg, db, ex, cl, clock=lambda: 1_787_000_900).mark_positions()
+    Strategy(single_cfg, db, ex, cl, clock=lambda: 1_787_000_900).mark_positions()
 
     rows = {r["horizon_minutes"]: r for r in clv_at_horizons(db, [15, 60])}
     assert rows[15]["measured"] == 1
@@ -184,17 +184,17 @@ def test_clv_at_horizons_uses_the_mark_path(db, cfg):
     assert rows[60]["mean_clv_pct"] is None
 
 
-def test_horizon_clv_ignores_gamma_marks(db, cfg):
+def test_horizon_clv_ignores_gamma_marks(db, single_cfg):
     """A gamma price for a resolved market is the outcome, not a market price."""
     books = {"TOK1": book(asks=[(0.20, 10_000)], bids=[(0.19, 10_000)])}
     ex = FakeExecutor(books=books)
     cl = FakeClient(books=books, metas={"0xcond1": make_meta()})
-    s = Strategy(cfg, db, ex, cl, clock=lambda: 1_787_000_000)
+    s = Strategy(single_cfg, db, ex, cl, clock=lambda: 1_787_000_000)
     s.process_trades([make_trade(price=0.20, ts=1_787_000_000)])
 
     cl.books["TOK1"] = book(asks=[], bids=[])
     cl.metas["0xcond1"] = make_meta(prices=(1.0, 0.0), closed=True)
-    Strategy(cfg, db, ex, cl, clock=lambda: 1_787_000_900).mark_positions()
+    Strategy(single_cfg, db, ex, cl, clock=lambda: 1_787_000_900).mark_positions()
 
     rows = {r["horizon_minutes"]: r for r in clv_at_horizons(db, [15])}
     assert rows[15]["measured"] == 0

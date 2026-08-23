@@ -43,6 +43,7 @@ class SkipReason(str, Enum):
     PRICE_ABOVE_MAX_ENTRY = "his_price_above_max_entry"
     TRADE_TOO_OLD = "trade_older_than_max_age"
     ALREADY_AT_MAX_COPIES = "already_hold_max_copies_for_token"
+    TOKEN_BUDGET_SPENT = "per_token_budget_already_spent"
     NOT_ENOUGH_CASH = "not_enough_cash"
     EMPTY_BOOK = "book_empty"
     BOOK_TOO_THIN = "book_too_thin_to_fill_stake"

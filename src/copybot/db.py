@@ -420,6 +420,20 @@ class Database:
         )
         return int(row["n"]) if row else 0
 
+    def spent_on_token(self, token_id: str) -> float:
+        """Cash already committed to this token, fees included.
+
+        The per-token budget is a hard cap, so this is measured from the
+        executions ledger rather than tracked in memory -- a restart must not
+        be able to forget that a token is already funded.
+        """
+        row = self._one(
+            "SELECT COALESCE(SUM(-net_usd), 0) AS s FROM copied_trades "
+            "WHERE token_id = ? AND side = 'BUY'",
+            (token_id,),
+        )
+        return row["s"] if row else 0.0
+
     def open_condition_ids(self) -> list[str]:
         return [r["condition_id"] for r in
                 self._all("SELECT DISTINCT condition_id FROM positions WHERE status='open'")]

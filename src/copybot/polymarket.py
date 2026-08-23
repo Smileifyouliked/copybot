@@ -215,6 +215,24 @@ class PolymarketClient:
                 out[token_id] = self._empty_book(token_id)
         return out
 
+    def get_trades(self, condition_id: str, limit: int = 200,
+                   offset: int = 0) -> list[dict[str, Any]]:
+        """The public tape of executed trades for one market, newest first.
+
+        This is the ground truth for whether a resting order would have filled:
+        a print at or below our limit price means the market actually traded
+        through us. Without it, "did our limit fill?" is a guess, and guessing
+        generously is the infinite-liquidity mistake wearing a different hat.
+        """
+        data = self._request(
+            "GET", f"{DATA_API}/trades",
+            params={"market": condition_id, "limit": limit, "offset": offset},
+        )
+        if not isinstance(data, list):
+            raise PolymarketError(f"/trades returned {type(data).__name__}, expected list")
+        assert_complete_page(data, limit, what=f"data-api /trades {condition_id[:12]}")
+        return data
+
     # -- markets -----------------------------------------------------------
     def get_markets(self, condition_ids: Iterable[str],
                     force: bool = False) -> dict[str, MarketMeta]:

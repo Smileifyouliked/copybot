@@ -39,6 +39,20 @@ def cfg():
     return load_config(Path(__file__).resolve().parents[1] / "config.yaml")
 
 
+@pytest.fixture
+def single_cfg(cfg):
+    """One full-stake copy per token, 50c cap.
+
+    Tests about sells, settlement and marking predate follow-him-down and are
+    not about it. Pinning the entry rules here keeps them testing the thing
+    they were written to test, instead of silently becoming budget tests.
+    """
+    return dataclasses.replace(
+        cfg, max_entry_price=0.50, our_max_fill_price=0.50,
+        shadow_band_max_price=0.50, max_copies_per_token=1, stake_schedule=[1.0],
+    )
+
+
 def tweak(cfg, **overrides):
     return dataclasses.replace(cfg, **overrides)
 
