@@ -87,6 +87,9 @@ screen -S dash -dm bash -c 'PYTHONPATH=src .venv/bin/python -m copybot.main dash
 | Stop it | `screen -S copybot -X quit` |
 | Peek without attaching | `tail -f ~/copybot/logs/copybot.log` |
 
+`run-forever.sh` restarts a crashed bot, but not a rejected config (exit 2) or
+a database another bot already holds (exit 3). Neither heals by waiting.
+
 To survive reboots, add a crontab entry with `crontab -e`:
 
 ```
@@ -104,6 +107,128 @@ cd ~/copybot
 PYTHONPATH=src .venv/bin/python -m copybot.main run          # the bot
 PYTHONPATH=src .venv/bin/python -m copybot.main dashboard    # the dashboard
 ```
+
+---
+
+## Wiping the server and starting over
+
+For when you want nothing of the old install left. Every destructive step is
+preceded by a step that *shows you what it will destroy* — read that output
+before running the next command.
+
+### 1. Stop everything, and make sure nothing restarts it
+
+The systemd units matter even if you plan to use `screen`: left enabled, they
+start a second bot at the next reboot, and two bots on one database is the
+failure this project already had once.
+
+```bash
+sudo systemctl stop copybot copybot-dashboard 2>/dev/null
+sudo systemctl disable copybot copybot-dashboard 2>/dev/null
+sudo rm -f /etc/systemd/system/copybot.service /etc/systemd/system/copybot-dashboard.service
+sudo systemctl daemon-reload
+
+screen -ls                                    # see what is running
+screen -S copybot -X quit 2>/dev/null
+screen -S dash -X quit 2>/dev/null
+pkill -f "copybot.main" 2>/dev/null
+
+crontab -l 2>/dev/null | grep copybot         # any @reboot line?
+crontab -l 2>/dev/null | grep -v copybot | crontab -   # removes only those lines
+```
+
+Confirm the server is quiet. **Both of these must print `0`:**
+
+```bash
+ps aux | grep -c "[c]opybot.main"
+screen -ls 2>/dev/null | grep -c copybot
+```
+
+### 2. Look at what you are about to delete
+
+```bash
+ls -la ~/copybot
+sudo find / -name "copybot*.sqlite3*" -not -path "*/proc/*" 2>/dev/null
+```
+
+The second command finds databases anywhere on the box, including ones outside
+`~/copybot`. **If it lists a file you want to keep, copy it somewhere else
+now** — the next step does not ask twice.
+
+### 3. Delete it
+
+```bash
+rm -rf ~/copybot
+ls ~/copybot 2>&1                             # "No such file or directory"
+```
+
+### 4. Install clean
+
+```bash
+sudo apt update && sudo apt install -y python3-venv git screen
+git clone https://github.com/Smileifyouliked/copybot.git ~/copybot
+cd ~/copybot
+
+python3 -m venv .venv
+.venv/bin/pip install -q -r requirements.txt
+mkdir -p data logs
+chmod +x scripts/run-forever.sh
+
+.venv/bin/python -m pytest -q                 # must pass, nothing skipped
+grep '^entry_mode' config.yaml                # must say "limit"
+grep '^mode' config.yaml                      # must say "paper"
+PYTHONPATH=src .venv/bin/python -m copybot.main status
+```
+
+`status` on a clean install reports `$150.00` cash, no open positions and
+`last heartbeat: never`. That is what an empty ledger looks like, not a fault.
+
+### 5. Start it in a detached `screen`
+
+```bash
+cd ~/copybot
+screen -S copybot -dm ./scripts/run-forever.sh
+screen -S dash -dm bash -c 'PYTHONPATH=src .venv/bin/python -m copybot.main dashboard'
+screen -ls                                    # both should be listed as Detached
+```
+
+Give it a minute, then check it is actually working:
+
+```bash
+sleep 60
+PYTHONPATH=src .venv/bin/python -m copybot.main status     # heartbeat seconds ago
+tail -20 logs/copybot.log
+```
+
+`last heartbeat: never` after a minute means it is not running — attach with
+`screen -r copybot` and read the error.
+
+### 6. Survive a reboot
+
+`screen` does not. Add one crontab line with `crontab -e`:
+
+```
+@reboot cd /home/ubuntu/copybot && /usr/bin/screen -S copybot -dm ./scripts/run-forever.sh
+```
+
+Use your real path if you did not clone to `/home/ubuntu/copybot`.
+
+### Living with it
+
+| Task | Command |
+|---|---|
+| Read the numbers | `PYTHONPATH=src .venv/bin/python -m copybot.main report` |
+| Watch them update | `PYTHONPATH=src .venv/bin/python -m copybot.main report --watch` |
+| Attach to the bot | `screen -r copybot` |
+| Detach again | `Ctrl-A` then `D` — **not** `Ctrl-C`, which stops the bot |
+| Tail the log instead | `tail -f ~/copybot/logs/copybot.log` |
+| Stop it | `screen -S copybot -X quit` |
+| Did it crash? | `cat logs/restarts.log` — should stay empty |
+
+`run-forever.sh` restarts the bot if it crashes, but deliberately does **not**
+restart it when the config is rejected or when another bot already holds the
+database. Neither of those heals by waiting, and looping on them would bury the
+one line telling you what to fix.
 
 ---
 

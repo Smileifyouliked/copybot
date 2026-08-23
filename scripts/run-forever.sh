@@ -59,11 +59,28 @@ while true; do
     wait "$child"
     code=$?
 
-    # Exit code 0 means a clean shutdown was asked for. Honour it.
-    if [ $code -eq 0 ]; then
-        echo "[run-forever] copybot exited cleanly. Not restarting."
-        exit 0
-    fi
+    # Some exits are decisions, not crashes. Restarting on those turns a clear
+    # one-line refusal into a 10-second loop that fills restarts.log with
+    # thousands of entries and hides the real message -- while the condition
+    # that caused it (a bad config, another bot holding the database) sits
+    # there unfixed, because nothing about waiting 10 seconds fixes either one.
+    case $code in
+        0)
+            echo "[run-forever] copybot exited cleanly. Not restarting."
+            exit 0
+            ;;
+        2)
+            echo "[run-forever] config was rejected. Fix config.yaml, then start" \
+                 "this again. Not restarting -- a bad config does not heal." >&2
+            exit 2
+            ;;
+        3)
+            echo "[run-forever] another copybot is already running against this" \
+                 "database. Stop it first (screen -ls, ps aux | grep copybot)." \
+                 "Not restarting -- waiting cannot win a lock someone else holds." >&2
+            exit 3
+            ;;
+    esac
 
     restarts=$((restarts + 1))
     echo "[run-forever] copybot exited with code $code -- restart #$restarts in ${RESTART_DELAY}s"
