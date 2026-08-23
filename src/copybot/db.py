@@ -46,8 +46,53 @@ CREATE TABLE IF NOT EXISTS processed_trade_ids (
 CREATE INDEX IF NOT EXISTS idx_ptid_token ON processed_trade_ids(token_id, side, traded_ts);
 CREATE INDEX IF NOT EXISTS idx_ptid_traded ON processed_trade_ids(traded_ts);
 
+-- One row per experiment. Runs are compared against each other, so each one
+-- records the config that produced it and the code that ran it; a number with
+-- no idea which rules generated it is not evidence.
+CREATE TABLE IF NOT EXISTS runs (
+    run_id      TEXT PRIMARY KEY,
+    started_ts  INTEGER NOT NULL,
+    entry_mode  TEXT,
+    git_commit  TEXT,
+    config_json TEXT NOT NULL,
+    note        TEXT
+);
+
+-- Limit orders waiting on the book. Persisted so a restart resumes them
+-- instead of forgetting money is committed.
+CREATE TABLE IF NOT EXISTS resting_orders (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id             TEXT,
+    trade_key          TEXT UNIQUE,
+    token_id           TEXT NOT NULL,
+    condition_id       TEXT,
+    question           TEXT,
+    limit_price        REAL NOT NULL,
+    his_price          REAL NOT NULL,
+    usd_budget         REAL NOT NULL,
+    target_shares      REAL NOT NULL,
+    queue_ahead_shares REAL NOT NULL,
+    placed_ts          INTEGER NOT NULL,
+    expires_ts         INTEGER NOT NULL,
+    status             TEXT NOT NULL,   -- resting | filled | partial | expired
+    filled_shares      REAL NOT NULL DEFAULT 0,
+    filled_usd         REAL NOT NULL DEFAULT 0,
+    fee_usd            REAL NOT NULL DEFAULT 0,
+    consumed_shares    REAL NOT NULL DEFAULT 0,
+    prints_observed    INTEGER NOT NULL DEFAULT 0,
+    alt_filled_shares  REAL NOT NULL DEFAULT 0,
+    alt_consumed_shares REAL NOT NULL DEFAULT 0,
+    alt_prints_observed INTEGER NOT NULL DEFAULT 0,
+    stake_variant_usd  REAL,
+    settled_ts         INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_resting_status ON resting_orders(status, expires_ts);
+CREATE INDEX IF NOT EXISTS idx_resting_token ON resting_orders(token_id);
+
 CREATE TABLE IF NOT EXISTS positions (
     id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id               TEXT,
+    stake_variant_usd    REAL,
     token_id             TEXT NOT NULL,
     condition_id         TEXT NOT NULL,
     question             TEXT,
@@ -270,6 +315,8 @@ class Database:
             ("closing_line_ts", "INTEGER"),
             ("closing_line_age_seconds", "INTEGER"),
             ("closing_line_captured", "INTEGER NOT NULL DEFAULT 0"),
+            ("run_id", "TEXT"),
+            ("stake_variant_usd", "REAL"),
         ):
             if col not in have:
                 self._conn.execute(f"ALTER TABLE positions ADD COLUMN {col} {decl}")
@@ -420,6 +467,71 @@ class Database:
         )
         return int(row["n"]) if row else 0
 
+    def resting_exposure(self, token_id: str) -> float:
+        """Dollars sitting on the book for this token, still unfilled.
+
+        A resting order is money committed even though no cash has moved: if it
+        fills, it fills. Counting only executed fills against the per-token cap
+        would let four of his fills place four orders against a three-order
+        budget, and the cap would only be breached later, on the tape, where
+        nothing checks it.
+        """
+        row = self._one(
+            "SELECT COALESCE(SUM(MAX(usd_budget - filled_usd, 0)), 0) AS s "
+            "FROM resting_orders WHERE token_id = ? "
+            "AND status IN ('resting', 'partial')",
+            (token_id,),
+        )
+        return float(row["s"]) if row else 0.0
+
+    def committed_on_token(self, token_id: str) -> float:
+        """Everything this token has claimed: cash spent plus resting exposure."""
+        return self.spent_on_token(token_id) + self.resting_exposure(token_id)
+
+    def count_commitments_for_token(self, token_id: str) -> int:
+        """How many of his fills we are currently acting on for this token.
+
+        Distinct by trade key, so a partially filled resting order -- which has
+        both an execution and an open order -- claims one slot, not two. An
+        order that expired without filling claims none: no money moved and no
+        position exists, so the slot is genuinely free again.
+        """
+        row = self._one(
+            "SELECT COUNT(*) AS n FROM ("
+            "  SELECT trade_key FROM copied_trades "
+            "   WHERE token_id = ? AND side = 'BUY' AND trade_key IS NOT NULL"
+            "  UNION"
+            "  SELECT trade_key FROM resting_orders "
+            "   WHERE token_id = ? AND status IN ('resting', 'partial')"
+            ")",
+            (token_id, token_id),
+        )
+        return int(row["n"]) if row else 0
+
+    def assigned_budget(self, token_id: str) -> float | None:
+        """The per-token budget already assigned to this token, if any.
+
+        The budget is chosen once, on the first fill we act on, and then reused
+        for every later tranche. Recomputing it per fill would let a cheaper
+        later price hand the token a smaller budget than it has already spent,
+        which is exactly the kind of drift the hard cap exists to prevent.
+        """
+        row = self._one(
+            "SELECT stake_variant_usd AS v FROM positions "
+            "WHERE token_id = ? AND stake_variant_usd IS NOT NULL "
+            "ORDER BY opened_ts ASC LIMIT 1",
+            (token_id,),
+        )
+        if row and row["v"]:
+            return float(row["v"])
+        row = self._one(
+            "SELECT stake_variant_usd AS v FROM resting_orders "
+            "WHERE token_id = ? AND stake_variant_usd IS NOT NULL "
+            "ORDER BY placed_ts ASC LIMIT 1",
+            (token_id,),
+        )
+        return float(row["v"]) if row and row["v"] else None
+
     def spent_on_token(self, token_id: str) -> float:
         """Cash already committed to this token, fees included.
 
@@ -510,6 +622,123 @@ class Database:
     def skip_counts(self) -> dict[str, int]:
         return {r["reason"]: r["n"] for r in
                 self._all("SELECT reason, COUNT(*) AS n FROM skipped_trades GROUP BY reason")}
+
+    # -- runs --------------------------------------------------------------
+    def start_run(self, run_id: str, cfg_json: str, entry_mode: str,
+                  git_commit: str, note: str = "") -> str:
+        self._conn.execute(
+            """INSERT OR IGNORE INTO runs
+               (run_id, started_ts, entry_mode, git_commit, config_json, note)
+               VALUES (?,?,?,?,?,?)""",
+            (run_id, now_ts(), entry_mode, git_commit, cfg_json, note),
+        )
+        return run_id
+
+    def runs(self) -> list[sqlite3.Row]:
+        return self._all("SELECT * FROM runs ORDER BY started_ts")
+
+    def latest_run(self) -> sqlite3.Row | None:
+        return self._one("SELECT * FROM runs ORDER BY started_ts DESC LIMIT 1")
+
+    # -- resting orders ----------------------------------------------------
+    def upsert_resting(self, conn: sqlite3.Connection, order, *, run_id: str,
+                       status: str, stake_variant: float | None = None) -> None:
+        conn.execute(
+            """INSERT INTO resting_orders
+               (run_id, trade_key, token_id, condition_id, question, limit_price,
+                his_price, usd_budget, target_shares, queue_ahead_shares,
+                placed_ts, expires_ts, status, filled_shares, filled_usd, fee_usd,
+                consumed_shares, prints_observed, alt_filled_shares,
+                alt_consumed_shares, alt_prints_observed, stake_variant_usd)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(trade_key) DO UPDATE SET
+                 status=excluded.status,
+                 filled_shares=excluded.filled_shares,
+                 filled_usd=excluded.filled_usd,
+                 fee_usd=excluded.fee_usd,
+                 consumed_shares=excluded.consumed_shares,
+                 prints_observed=excluded.prints_observed,
+                 alt_filled_shares=excluded.alt_filled_shares,
+                 alt_consumed_shares=excluded.alt_consumed_shares,
+                 alt_prints_observed=excluded.alt_prints_observed""",
+            (run_id, order.his_trade_key, order.token_id, order.condition_id,
+             order.question, order.limit_price, order.his_price, order.usd_budget,
+             order.target_shares, order.queue_ahead_shares, order.placed_ts,
+             order.expires_ts, status, order.filled_shares, order.filled_usd,
+             order.fee_usd, order.consumed_shares, order.prints_observed,
+             order.alt_filled_shares, order.alt_consumed_shares,
+             order.alt_prints_observed, stake_variant),
+        )
+
+    def open_resting(self) -> list[sqlite3.Row]:
+        return self._all("SELECT * FROM resting_orders WHERE status='resting' "
+                         "ORDER BY placed_ts")
+
+    def close_resting(self, conn: sqlite3.Connection, trade_key: str,
+                      status: str) -> None:
+        conn.execute("UPDATE resting_orders SET status=?, settled_ts=? "
+                     "WHERE trade_key=?", (status, now_ts(), trade_key))
+
+    def fill_rate_stats(self, run_id: str | None = None) -> dict:
+        """Of the orders we rested, what fraction filled at his price?
+
+        The number the limit-order experiment turns on. Reported under both
+        `side` conventions because which label means "seller" is unresolved.
+        """
+        where = "WHERE status != 'resting'"
+        params: list = []
+        if run_id:
+            where += " AND run_id = ?"
+            params.append(run_id)
+        row = self._one(
+            f"""SELECT COUNT(*) AS n,
+                       SUM(filled_shares > 0) AS any_fill,
+                       SUM(filled_shares >= target_shares - 1e-9) AS full_fill,
+                       COALESCE(SUM(filled_shares), 0) AS shares,
+                       COALESCE(SUM(target_shares), 0) AS target,
+                       SUM(alt_filled_shares > 0) AS alt_any_fill,
+                       COALESCE(SUM(alt_filled_shares), 0) AS alt_shares
+                FROM resting_orders {where}""", params)
+        n = row["n"] or 0
+        return {
+            "orders": n,
+            "any_fill": row["any_fill"] or 0,
+            "full_fill": row["full_fill"] or 0,
+            "fill_rate": ((row["any_fill"] or 0) / n) if n else None,
+            "full_fill_rate": ((row["full_fill"] or 0) / n) if n else None,
+            "share_fill_rate": ((row["shares"] / row["target"]) if row["target"] else None),
+            "alt_fill_rate": ((row["alt_any_fill"] or 0) / n) if n else None,
+            "alt_share_fill_rate": ((row["alt_shares"] / row["target"])
+                                    if row["target"] else None),
+        }
+
+    def vwap_ratio_stats(self, run_id: str | None = None) -> dict:
+        """our VWAP / his VWAP per token -- the headline entry-quality metric.
+
+        Break-even is 1.395 (NOTES.md S10): above it we lose money on a
+        confirmed edge, below it we make money.
+        """
+        where = "WHERE our_avg_fill > 0 AND his_vwap_entry > 0"
+        params: list = []
+        if run_id:
+            where += " AND run_id = ?"
+            params.append(run_id)
+        ratios = sorted(
+            r["ratio"] for r in self._all(
+                f"SELECT our_avg_fill / his_vwap_entry AS ratio FROM positions {where}",
+                params)
+        )
+        if not ratios:
+            return {"n": 0, "median": None, "mean": None, "p90": None, "over": 0}
+        n = len(ratios)
+        return {
+            "n": n,
+            "median": ratios[n // 2],
+            "mean": sum(ratios) / n,
+            "p90": ratios[min(n - 1, int(n * 0.9))],
+            "best": ratios[0],
+            "worst": ratios[-1],
+        }
 
     # -- shadow ladder -----------------------------------------------------
     def record_shadow_ladder(self, conn, rungs, *, trade=None, book=None,

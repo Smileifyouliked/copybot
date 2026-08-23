@@ -18,6 +18,10 @@ The model, deliberately conservative at every choice:
     consumed queue. Prints above our limit are irrelevant to us.
   * His own prints never count. His buy cannot be the seller that fills our
     bid, and letting it would mean trading against the wallet we copy.
+  * Only prints on OUR token count. The tape is fetched per market, and a
+    market has two tokens: a print at 0.20 on the complementary outcome is a
+    different book with a different queue. Verified against the live endpoint,
+    which stamps every row with `asset`.
   * **Both `side` conventions are computed, every time.** A print at or below
     our limit fills us only if a *seller* hit the bid; a buyer lifting an ask
     at the same price consumes no bid queue. Which label means "seller" is not
@@ -180,6 +184,14 @@ def apply_tape(
         except (KeyError, TypeError, ValueError):
             continue
         if size <= 0:
+            continue
+        asset = str(t.get("asset", "") or "")
+        if asset and order.token_id and asset != order.token_id:
+            # Same market, other outcome. Its 0.20 prints belong to a different
+            # book and a different queue. (A row without `asset` is counted:
+            # the caller fetched this tape for one market, and dropping
+            # unlabelled rows would zero a fill rate for a shape reason rather
+            # than a market one. Every live row sampled carries the field.)
             continue
         if ts < order.placed_ts or ts > min(now, order.expires_ts):
             continue

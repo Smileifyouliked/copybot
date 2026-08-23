@@ -10,6 +10,9 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
+import hashlib
+
+from . import limits
 from .config import Config
 from .db import Database, now_ts
 from .executor import Executor
@@ -24,6 +27,7 @@ log = logging.getLogger(__name__)
 class PollCounters:
     seen: int = 0
     copied: int = 0
+    rested: int = 0
     mirrored: int = 0
     skipped: int = 0
     ignored: int = 0
@@ -48,12 +52,63 @@ def _parse_end_date(value: str | None) -> int | None:
 
 class Strategy:
     def __init__(self, cfg: Config, db: Database, executor: Executor,
-                 client: PolymarketClient, clock=time.time):
+                 client: PolymarketClient, clock=time.time, run_id: str = ""):
         self.cfg = cfg
         self.db = db
         self.executor = executor
         self.client = client
         self.clock = clock
+        self.run_id = run_id
+
+    def stake_variant(self, token_id: str) -> float:
+        """Which stake this token is assigned to, before the exchange floor.
+
+        Resting orders are punished by queue position rather than depth, so a
+        smaller order may fill far more often. Assigning variants per token --
+        deterministically, so a restart keeps the assignment -- turns stake into
+        a tested variable instead of a constant nobody questioned.
+        """
+        variants = self.cfg.stake_variants_usd
+        if len(variants) <= 1:
+            return float(variants[0]) if variants else self.cfg.stake_per_copy_usd
+        digest = hashlib.sha256(token_id.encode()).digest()
+        return float(variants[digest[0] % len(variants)])
+
+    def budget_for(self, token_id: str, book=None, price: float | None = None) -> float:
+        """The hard per-token cap actually used, floor included.
+
+        Two things force this to be more than the hash:
+
+        1. The exchange minimum is a share count, so its dollar value rises with
+           price. At the 5-share minimum a $1 stake is unplaceable above 20c --
+           which would silently drop the entire 20-30c band out of the $1 arm
+           rather than measuring it. Snapping up to the smallest variant that
+           IS placeable keeps the arms at declared sizes and keeps the signal.
+           The arms still cover different price populations below 20c; that
+           confound is physical, not fixable here, and is why variants are
+           compared within price bands rather than pooled.
+        2. It must be assigned once. Recomputing per fill would let a cheaper
+           later price hand a token a smaller cap than it has already spent.
+        """
+        assigned = self.db.assigned_budget(token_id)
+        if assigned:
+            return assigned
+        if self.cfg.entry_mode != "limit":
+            # Variants exist because a resting order is punished by queue
+            # position, not by depth. Crossing has no such trade-off -- depth
+            # cost is already measured by the shadow ladder -- so varying size
+            # in market mode would add noise to a run that cannot answer the
+            # question anyway.
+            return self.cfg.stake_per_copy_usd
+        nominal = self.stake_variant(token_id)
+        if book is None or price is None:
+            return nominal
+        floor_usd = self._min_tranche_usd(book, price)
+        if floor_usd <= nominal + 1e-9:
+            return nominal
+        placeable = [float(v) for v in sorted(self.cfg.stake_variants_usd)
+                     if v >= floor_usd - 1e-9]
+        return placeable[0] if placeable else nominal
 
     def _now(self) -> int:
         return int(self.clock())
@@ -140,36 +195,42 @@ class Strategy:
             book, self._ladder_rungs(trade), decision_ts=decision_ts
         )
 
-        copies = self.db.count_copies_for_token(trade.token_id)
-        spent = self.db.spent_on_token(trade.token_id)
-        budget = self.cfg.stake_per_copy_usd
+        # Commitments, not fills: an order resting at his price is money the
+        # cap has to know about before the tape decides whether it fills.
+        copies = self.db.count_commitments_for_token(trade.token_id)
+        spent = self.db.committed_on_token(trade.token_id)
+        budget = self.budget_for(trade.token_id, book, trade.price)
         remaining = budget - spent
 
-        tranches = self._tranche_count(book, trade.price, budget)
-        if copies < tranches and remaining > 0.01:
-            # Follow him down. He averages ~5 fills per token and lands well
-            # below his opener, so taking only his first fill makes his VWAP
-            # unreachable by construction. The schedule splits one budget across
-            # his successive fills; it never adds a second budget.
-            shape = self.cfg.stake_schedule[:tranches]
-            total = sum(shape) or 1.0
-            stake = min(budget * (shape[copies] / total), remaining)
-            floor_usd = self._min_tranche_usd(book, trade.price)
-            if floor_usd > 0:
-                stake = min(max(stake, floor_usd), remaining)
-                # If what would be left over is itself too small to place, it
-                # can never be spent and would sit stranded for the life of the
-                # position. Absorb it now instead.
-                leftover = remaining - stake
-                if 0 < leftover < floor_usd:
-                    stake = remaining
-        else:
-            stake = 0.0
+        # Follow him down. He averages ~5 fills per token and lands well below
+        # his opener, so taking only his first fill makes his VWAP unreachable
+        # by construction. The schedule splits one budget across his successive
+        # fills; it never adds a second budget.
+        #
+        # The schedule is the intended split and the exchange minimum is a hard
+        # floor under each tranche. Nothing is ever rounded UP to consume the
+        # rest of the budget: an unspendable remainder costs us an
+        # under-deployed token, while absorbing it costs us his opening price
+        # -- the single worst price he pays -- and the whole thesis is that his
+        # opener is the price we must not be stuck at. The remainder is not
+        # stranded either: the floor is a share count, so it shrinks with price,
+        # and the fills we are waiting for are cheaper ones.
+        floor_usd = self._min_tranche_usd(book, trade.price)
+        stake = 0.0
+        if copies < self.cfg.max_copies_per_token and remaining > 0.01:
+            schedule = self.cfg.stake_schedule
+            shaped = budget * schedule[min(copies, len(schedule) - 1)]
+            stake = min(max(shaped, floor_usd), remaining)
+            if stake < floor_usd - 1e-9:
+                stake = 0.0  # what is left cannot be placed at this price
 
         if stake <= 0.01:
             reason = (SkipReason.ALREADY_AT_MAX_COPIES
                       if copies >= self.cfg.max_copies_per_token
                       else SkipReason.TOKEN_BUDGET_SPENT)
+            log.debug("no tranche for %s: %d copies, $%.4f of $%.2f left, "
+                      "floor $%.4f", trade.token_id[:16], copies, remaining,
+                      budget, floor_usd)
             # We are not copying this fill, but he is still scaling in. His
             # average entry keeps improving while ours is frozen, and that gap
             # is the whole point of tracking it -- so record the fill and
@@ -199,6 +260,10 @@ class Strategy:
                 book=book, rungs=rungs,
             )
 
+        if self.cfg.entry_mode == "limit":
+            return self._rest_at_his_price(trade, stake, budget, book,
+                                           decision_ts, counters, rungs)
+
         # The real decision uses the SAME snapshot the ladder was measured on,
         # so the two are directly comparable and no second fetch can slip a
         # different (possibly better) book into the fill.
@@ -212,6 +277,16 @@ class Strategy:
                 book=book, rungs=rungs,
             )
 
+        return self._record_buy(trade, fill, stake, budget, decision_ts, counters,
+                                book, rungs, path="market")
+
+    def _record_buy(self, trade: TargetTrade, fill, stake: float, budget: float,
+                    decision_ts: int, counters: PollCounters, book, rungs,
+                    *, path: str = "market") -> None:
+        """Commit a taker fill: ledger, position, ladder and mark, in one
+        transaction. Shared by the market path and by the limit path's
+        crossed-inside case, so both record the same fields and the only
+        difference between them is the recorded `path`."""
         band = entry_band(fill.avg_price)
         latency = decision_ts - trade.traded_ts
         slip_abs = fill.avg_price - trade.price
@@ -265,8 +340,7 @@ class Strategy:
                 )
             else:
                 position_id = self.db.insert_position(
-
-                    conn,
+                    conn, run_id=self.run_id, stake_variant_usd=budget,
                     token_id=trade.token_id, condition_id=trade.condition_id,
                     question=trade.title, outcome=trade.outcome,
                     outcome_index=trade.outcome_index,
@@ -341,27 +415,189 @@ class Strategy:
         if not self.cfg.respect_min_order_size or price <= 0:
             return 0.0
         per_share = price
-        if self.cfg.entry_mode == "market":
+        crossing = (self.cfg.entry_mode == "market"
+                    or limits.marketable(book, price))
+        if crossing:
+            # The stake is total outlay, fee included, so clearing a 5-share
+            # minimum as a taker costs 5 x (p + fee_per_share). A resting order
+            # that never crosses pays no fee at all, so its floor is just the
+            # shares. Limit mode still crosses when the book is already offering
+            # at or below his price, and that case pays the taker fee like any
+            # other -- so the floor follows what will actually happen, not what
+            # the mode is called.
             per_share += self.cfg.fee_rate_fallback * price * (1.0 - price)
         return book.min_order_size * per_share
 
-    def _tranche_count(self, book, price: float, budget: float) -> int:
-        """How many placeable tranches this price allows.
+    # =====================================================================
+    # Limit path
+    # =====================================================================
+    def _rest_at_his_price(self, trade: TargetTrade, stake: float, budget: float,
+                           book, decision_ts: int, counters: PollCounters,
+                           rungs) -> None:
+        """Place a resting buy at his exact fill price. Never cross.
 
-        The binding constraint is `tranche >= min_shares x price`, so the count
-        is `floor(budget / (min_shares x price))`. Deriving it from price rather
-        than fixing it means follow-him-down keeps working across the whole
-        band: at 2c the budget supports 30 tranches, at 20c exactly 3, at 29c
-        two of ~$1.50 each at 5.17 shares. Collapsing to a single fill above 20c
-        would disable follow-him-down across his 20-30c band -- his second-best
-        by return, and the one where a single early fill hurts most because the
-        absolute price gap is widest.
+        Nothing is committed here: no position, no cash movement. The order
+        either fills from the tape on a later poll or expires unfilled, and
+        which of those happens is the measurement the experiment turns on.
         """
-        cap = self.cfg.max_copies_per_token
-        floor_usd = self._min_tranche_usd(book, price)
-        if floor_usd <= 0:
-            return cap
-        return max(1, min(int(budget // floor_usd), cap))
+        if limits.marketable(book, trade.price):
+            # The book is already offering at or below his price, so resting
+            # would cross. That is a windfall, not slippage -- take it as a
+            # taker, at a price no worse than his, and record it as such.
+            fill = self.executor.buy(trade.token_id, stake, book=book,
+                                     decision_ts=decision_ts)
+            if not fill.filled:
+                return self._skip(trade, fill.skip_reason or SkipReason.BOOK_TOO_THIN,
+                                  counters, fill.detail, book=book, rungs=rungs)
+            return self._record_buy(trade, fill, stake, budget, decision_ts,
+                                    counters, book, rungs, path="crossed_inside")
+
+        order = self.executor.place_limit(
+            trade.token_id, stake, trade.price, book=book, now=decision_ts,
+            condition_id=trade.condition_id, his_trade_key=trade.trade_key,
+            question=trade.title,
+        )
+        with self.db.tx() as conn:
+            self.db.record_processed(trade, "rested", conn=conn)
+            self.db.upsert_resting(conn, order, run_id=self.run_id,
+                                   status="resting", stake_variant=budget)
+            self.db.record_shadow_ladder(conn, rungs, trade=trade, book=book,
+                                         question=trade.title, outcome="rested",
+                                         his_usd_size=trade.usd_size)
+        counters.rested += 1
+        log.info("REST $%.2f at %.4f (his price) on %s -- %.0f shares ahead in queue",
+                 stake, trade.price, trade.title[:44], order.queue_ahead_shares)
+
+    def poll_resting_orders(self) -> dict[str, int]:
+        """Advance every resting order against the tape, and settle expiries."""
+        stats = {"resting": 0, "filled": 0, "partial": 0, "expired": 0}
+        now = self._now()
+        for row in self.db.open_resting():
+            try:
+                order = self._rebuild_order(row)
+                order = self.executor.poll_limit(order, now)
+                gained = order.filled_shares - (row["filled_shares"] or 0.0)
+                if gained > 1e-9:
+                    self._book_limit_fill(order, gained, row)
+
+                if order.is_complete:
+                    status = "filled"
+                elif order.expired(now):
+                    status = "partial" if order.filled_shares > 0 else "expired"
+                else:
+                    status = "resting"
+                stats[status] = stats.get(status, 0) + 1
+                with self.db.tx() as conn:
+                    self.db.upsert_resting(conn, order, run_id=self.run_id,
+                                           status=status,
+                                           stake_variant=row["stake_variant_usd"])
+                    if status != "resting":
+                        self.db.close_resting(conn, order.his_trade_key, status)
+                if status in ("expired", "partial"):
+                    log.info("ORDER %s at %.4f: %s", status, order.limit_price,
+                             limits.describe(order))
+            except Exception:
+                log.exception("resting order %s failed to advance; continuing",
+                              row["trade_key"])
+        return stats
+
+    def _rebuild_order(self, row) -> "limits.RestingOrder":
+        return limits.RestingOrder(
+            token_id=row["token_id"], condition_id=row["condition_id"] or "",
+            limit_price=row["limit_price"], usd_budget=row["usd_budget"],
+            target_shares=row["target_shares"], placed_ts=row["placed_ts"],
+            expires_ts=row["expires_ts"],
+            queue_ahead_shares=row["queue_ahead_shares"],
+            his_price=row["his_price"], his_trade_key=row["trade_key"],
+            question=row["question"] or "",
+            filled_shares=row["filled_shares"] or 0.0,
+            filled_usd=row["filled_usd"] or 0.0,
+            fee_usd=row["fee_usd"] or 0.0,
+            consumed_shares=row["consumed_shares"] or 0.0,
+            prints_observed=row["prints_observed"] or 0,
+            alt_filled_shares=row["alt_filled_shares"] or 0.0,
+            alt_consumed_shares=row["alt_consumed_shares"] or 0.0,
+            alt_prints_observed=row["alt_prints_observed"] or 0,
+        )
+
+    def _book_limit_fill(self, order, gained_shares: float, row) -> None:
+        """Turn an incremental resting fill into position and ledger rows."""
+        ts = self._now()
+        gross = gained_shares * order.limit_price
+        fee = 0.0  # maker: takerOnly is true on every live schedule sampled
+        cash = self.db.cash()
+        if cash < gross:
+            log.warning("resting fill on %s needs $%.2f but only $%.2f is free; "
+                        "booking what we can afford", order.token_id[:16], gross, cash)
+            if cash <= 0:
+                return
+            gained_shares = cash / order.limit_price
+            gross = cash
+
+        band = entry_band(order.limit_price)
+        with self.db.tx() as conn:
+            existing = self.db.open_position_for_token(order.token_id)
+            his_vwap, his_n, his_shares, his_usd = self.db.his_vwap_entry(order.token_id)
+            his_vwap = his_vwap or order.his_price
+            if existing is not None:
+                shares_opened = existing["shares_opened"] + gained_shares
+                gross_total = existing["our_avg_fill"] * existing["shares_opened"] + gross
+                vwap = gross_total / shares_opened if shares_opened else order.limit_price
+                position_id = existing["id"]
+                self.db.update_position(
+                    conn, position_id,
+                    shares=existing["shares"] + gained_shares,
+                    shares_opened=shares_opened,
+                    cost_basis_usd=existing["cost_basis_usd"] + gross,
+                    cost_basis_opened=existing["cost_basis_opened"] + gross,
+                    our_avg_fill=vwap, entry_band=entry_band(vwap),
+                    his_vwap_entry=his_vwap, his_fill_count=his_n,
+                    his_total_shares=his_shares, his_total_usd=his_usd,
+                    his_position_usd_total=his_usd,
+                    slippage_vs_his_vwap=vwap - his_vwap,
+                    slippage_vs_his_vwap_pct=((vwap - his_vwap) / his_vwap * 100.0
+                                              if his_vwap > 0 else None),
+                    last_mark_price=order.limit_price, last_mark_ts=ts,
+                )
+            else:
+                position_id = self.db.insert_position(
+                    conn, run_id=self.run_id,
+                    stake_variant_usd=row["stake_variant_usd"],
+                    token_id=order.token_id, condition_id=order.condition_id,
+                    question=order.question, outcome="", outcome_index=0,
+                    status="open", opened_ts=ts,
+                    shares=gained_shares, shares_opened=gained_shares,
+                    cost_basis_usd=gross, cost_basis_opened=gross,
+                    our_avg_fill=order.limit_price, entry_fee_usd=0.0,
+                    entry_band=band,
+                    his_first_price=order.his_price, his_first_ts=order.placed_ts,
+                    his_vwap_entry=his_vwap, his_fill_count=his_n,
+                    his_total_shares=his_shares, his_total_usd=his_usd,
+                    his_position_usd_at_copy=his_usd,
+                    his_position_usd_total=his_usd,
+                    slippage_vs_his_entry=order.limit_price - order.his_price,
+                    slippage_vs_his_entry_pct=0.0,
+                    slippage_vs_his_vwap=order.limit_price - his_vwap,
+                    slippage_vs_his_vwap_pct=((order.limit_price - his_vwap)
+                                              / his_vwap * 100.0 if his_vwap > 0 else None),
+                    last_mark_price=order.limit_price, last_mark_ts=ts,
+                    last_mark_source=MarkSource.ENTRY_PRICE.value,
+                )
+            self.db.insert_execution(
+                conn, position_id=position_id, trade_key=order.his_trade_key,
+                token_id=order.token_id, condition_id=order.condition_id,
+                question=order.question, side=Side.BUY.value, ts=ts,
+                shares=gained_shares, avg_fill=order.limit_price,
+                gross_usd=gross, fee_usd=fee, net_usd=-(gross + fee),
+                levels_consumed=0, fee_rate_used=0.0, fee_rate_was_fallback=0,
+                entry_band=band, his_price=order.his_price,
+                his_ts=order.placed_ts, his_vwap_at_copy=his_vwap,
+                latency_seconds=ts - order.placed_ts,
+                slippage_vs_his_entry=0.0, slippage_vs_his_entry_pct=0.0,
+                note="resting fill at his price",
+            )
+        log.info("FILL %.4f shares at %.4f (his price) on %s", gained_shares,
+                 order.limit_price, (order.question or order.token_id)[:44])
 
     def _ladder_rungs(self, trade: TargetTrade) -> list[tuple[str, float]]:
         """Fixed rungs plus his own size.

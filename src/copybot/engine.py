@@ -12,11 +12,17 @@ Reliability rules this file exists to enforce:
 """
 from __future__ import annotations
 
+import dataclasses
+import errno
+import json
 import logging
 import logging.handlers
+import os
 import random
 import signal
+import subprocess
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import Config
@@ -27,6 +33,96 @@ from .polymarket import PolymarketClient, PolymarketError
 from .strategy import Strategy
 
 log = logging.getLogger(__name__)
+
+
+class AlreadyRunning(RuntimeError):
+    """Another process holds the lock on this database."""
+
+
+class InstanceLock:
+    """One bot per database, enforced by an OS lock rather than by discipline.
+
+    This exists because it already happened: a manually started process ran
+    alongside the systemd unit for 41 hours against the same file. Nothing was
+    double-copied -- dedup held -- but two writers racing the same read-then-write
+    window is not a property to leave to luck.
+
+    flock is used rather than a PID file because the kernel releases it when the
+    process dies, however it dies. A stale file cannot lock anyone out.
+    """
+
+    def __init__(self, db_path: str | Path):
+        self.path = Path(str(db_path) + ".lock")
+        self._fh = None
+
+    def acquire(self) -> "InstanceLock":
+        import fcntl
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = open(self.path, "w")
+        try:
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            self._fh.close()
+            self._fh = None
+            if exc.errno in (errno.EACCES, errno.EAGAIN):
+                holder = self._holder()
+                raise AlreadyRunning(
+                    f"another copybot already holds {self.path}"
+                    + (f" (pid {holder})" if holder else "")
+                    + " -- stop it before starting this one"
+                ) from exc
+            raise
+        self._fh.write(f"{os.getpid()}\n")
+        self._fh.flush()
+        return self
+
+    def _holder(self) -> str:
+        try:
+            return self.path.read_text().strip()
+        except OSError:
+            return ""
+
+    def release(self) -> None:
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+
+    def __enter__(self):
+        return self.acquire()
+
+    def __exit__(self, *_exc):
+        self.release()
+
+
+def _git_commit() -> str:
+    """Which code produced these numbers. Blank if not a checkout."""
+    try:
+        out = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                             capture_output=True, text=True, timeout=5,
+                             cwd=Path(__file__).resolve().parents[2])
+        return out.stdout.strip() if out.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def new_run_id(cfg: Config) -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"{stamp}-{cfg.entry_mode}"
+
+
+def register_run(db: Database, cfg: Config, note: str = "") -> str:
+    """Stamp this run into the database with the config that produced it.
+
+    Every row we write carries a run_id, so a database that spans a market-order
+    run and a limit-order run can still answer either question separately. The
+    config is snapshotted as JSON because "what were the settings then" is not
+    answerable from a config file that has since been edited.
+    """
+    run_id = new_run_id(cfg)
+    db.start_run(run_id, json.dumps(dataclasses.asdict(cfg), sort_keys=True,
+                                    default=str),
+                 cfg.entry_mode, _git_commit(), note)
+    return run_id
 
 
 def setup_logging(cfg: Config) -> None:
@@ -59,11 +155,13 @@ def setup_logging(cfg: Config) -> None:
 
 class Engine:
     def __init__(self, cfg: Config, db: Database, client: PolymarketClient,
-                 strategy: Strategy):
+                 strategy: Strategy, lock: InstanceLock | None = None):
         self.cfg = cfg
         self.db = db
         self.client = client
         self.strategy = strategy
+        self.lock = lock
+        self.limit_mode = cfg.entry_mode == "limit"
         self.running = True
 
         now = time.monotonic()
@@ -95,17 +193,28 @@ class Engine:
         fresh = [t for t in trades if t.trade_key not in known]
 
         counters = self.strategy.process_trades(fresh)
+
+        # Resting orders are advanced on every pass, before anything else can
+        # sleep: an order only fills against prints inside its TTL, so a pass we
+        # skip is fills we can never see again. This runs even when no new trade
+        # arrived, which is most passes.
+        resting = self.strategy.poll_resting_orders() if self.limit_mode else {}
+
         self.db.write_heartbeat(
             ok=True, trades_seen=len(rows), copies_made=counters.copied,
             skips=counters.skipped,
-            note=f"new={len(fresh)} mirrored={counters.mirrored} "
+            note=f"new={len(fresh)} rested={counters.rested} "
+                 f"mirrored={counters.mirrored} "
                  f"ignored={counters.ignored} malformed={malformed} "
-                 f"errors={counters.errors}",
+                 f"errors={counters.errors}"
+                 + (f" orders={resting}" if resting else ""),
         )
-        if counters.copied or counters.mirrored or counters.skipped:
-            log.info("pass: %d new of %d rows -> %d copied, %d mirrored, %d skipped",
-                     len(fresh), len(rows), counters.copied, counters.mirrored,
-                     counters.skipped)
+        if resting.get("filled") or resting.get("partial") or resting.get("expired"):
+            log.info("resting orders: %s", resting)
+        if counters.copied or counters.rested or counters.mirrored or counters.skipped:
+            log.info("pass: %d new of %d rows -> %d copied, %d rested, %d mirrored, "
+                     "%d skipped", len(fresh), len(rows), counters.copied,
+                     counters.rested, counters.mirrored, counters.skipped)
 
     def periodic_work(self) -> None:
         now = time.monotonic()
@@ -140,10 +249,11 @@ class Engine:
 
     # -- the loop ----------------------------------------------------------
     def run(self) -> None:
-        log.info("copybot starting in %s mode | wallet %s | $%.2f capital | "
-                 "$%.2f per copy | polling every %ds",
-                 self.cfg.mode, self.cfg.target_wallet, self.cfg.starting_capital_usd,
-                 self.cfg.stake_per_copy_usd, self.cfg.poll_interval_seconds)
+        log.info("copybot starting in %s mode | %s entries | wallet %s | "
+                 "$%.2f capital | $%.2f per token | polling every %ds | run %s",
+                 self.cfg.mode, self.cfg.entry_mode, self.cfg.target_wallet,
+                 self.cfg.starting_capital_usd, self.cfg.stake_per_copy_usd,
+                 self.cfg.poll_interval_seconds, self.strategy.run_id or "-")
         ok, parts = self.db.reconcile()
         log.info("recovered state: cash $%.2f, %d open position(s), "
                  "realised P&L $%+.2f, %d of his trades already seen (reconciles: %s)",
@@ -181,6 +291,8 @@ class Engine:
             elapsed = time.monotonic() - started
             self._sleep(max(0.0, delay - elapsed))
 
+        if self.lock is not None:
+            self.lock.release()
         log.info("copybot stopped cleanly")
 
     def _backoff(self) -> float:
@@ -197,10 +309,15 @@ class Engine:
 
 
 def build_engine(cfg: Config) -> Engine:
+    # The lock is taken before the database is opened, so a second instance
+    # fails before it can write anything at all.
+    lock = InstanceLock(cfg.db_path).acquire()
     db = Database(cfg.db_path, cfg.starting_capital_usd)
-    client = PolymarketClient()
-    strategy = Strategy(cfg, db, build_executor(cfg, client), client)
-    engine = Engine(cfg, db, client, strategy)
+    run_id = register_run(db, cfg)
+    strategy_client = PolymarketClient()
+    strategy = Strategy(cfg, db, build_executor(cfg, strategy_client),
+                        strategy_client, run_id=run_id)
+    engine = Engine(cfg, db, strategy_client, strategy, lock=lock)
     signal.signal(signal.SIGTERM, engine.request_stop)
     signal.signal(signal.SIGINT, engine.request_stop)
     return engine

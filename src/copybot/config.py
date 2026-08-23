@@ -242,13 +242,6 @@ def _validate(cfg: Config) -> None:
 
     if cfg.entry_mode not in ("limit", "market"):
         raise ConfigError(f"entry_mode must be 'limit' or 'market', got {cfg.entry_mode!r}")
-    if cfg.entry_mode == "limit":
-        raise ConfigError(
-            "entry_mode: limit is not wired into the buy path yet. limits.py "
-            "implements and tests the resting-order model, but strategy.py "
-            "still crosses the spread, so running in limit mode would silently "
-            "market-buy. Leave it on 'market' until the wiring lands."
-        )
     if cfg.limit_queue_model not in ("back", "front"):
         raise ConfigError(f"limit_queue_model must be 'back' or 'front', got "
                           f"{cfg.limit_queue_model!r}")

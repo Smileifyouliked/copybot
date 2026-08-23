@@ -21,16 +21,20 @@ our_max_fill_price: 0.30       # our own fill must also be under this, or skip
 # picks. "limit" rests at his exact fill price and either fills or does not.
 # Break-even is our VWAP / his VWAP = 1.395 (see NOTES.md S10), so entry quality
 # is the whole experiment and fill rate is the number that decides it.
-# NOT YET WIRED into the strategy -- the resting-order model in limits.py is
-# built and tested, but the buy path still crosses the spread. Left on "market"
-# so this file describes what the code actually does. Flip to "limit" in the
-# same commit that wires it.
-entry_mode: "market"           # "limit" | "market"
+# Wired: the buy path places a resting order at his price, the loop advances it
+# against the executed tape every pass, and it fills, part-fills or expires. An
+# expired order costs nothing and frees its slot. If the book is ALREADY
+# offering at or below his price we cross instead -- that is a windfall, not
+# slippage -- and it is recorded as a separate path so it never flatters the
+# fill rate.
+entry_mode: "limit"            # "limit" | "market"
 limit_order_ttl_seconds: 300   # how long an order rests before being cancelled
 limit_queue_model: "back"      # "back" = assume we join behind all resting size
 # Only seller-initiated prints consume our resting bid. The tape's `side`
-# convention could not be pinned down decisively, so this errs conservative:
-# correct if `side` is the taker's, merely under-counting fills if it is not.
+# convention could not be pinned down decisively. This setting drives the
+# position; the OPPOSITE reading is computed and stored alongside every order,
+# because if the convention is inverted this does not under-count, it measures
+# a different population, and the direction of that error is unknown.
 limit_fill_requires_sell_prints: true
 
 # Following him down: he averages ~5 fills per token and lands well below his
