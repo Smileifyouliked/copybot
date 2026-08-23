@@ -712,11 +712,15 @@ class Database:
                                     if row["target"] else None),
         }
 
-    def vwap_ratio_stats(self, run_id: str | None = None) -> dict:
+    def vwap_ratio_stats(self, run_id: str | None = None,
+                         breakeven: float = 1.395) -> dict:
         """our VWAP / his VWAP per token -- the headline entry-quality metric.
 
         Break-even is 1.395 (NOTES.md S10): above it we lose money on a
-        confirmed edge, below it we make money.
+        confirmed edge, below it we make money. The share of positions above
+        that line is reported alongside the average, because an average of 1.2
+        made of half at 1.0 and half at 1.4 is a different business from every
+        position sitting at 1.2.
         """
         where = "WHERE our_avg_fill > 0 AND his_vwap_entry > 0"
         params: list = []
@@ -729,8 +733,11 @@ class Database:
                 params)
         )
         if not ratios:
-            return {"n": 0, "median": None, "mean": None, "p90": None, "over": 0}
+            return {"n": 0, "median": None, "mean": None, "p90": None,
+                    "best": None, "worst": None, "over_breakeven": 0,
+                    "over_breakeven_rate": None, "breakeven": breakeven}
         n = len(ratios)
+        over = sum(1 for r in ratios if r > breakeven)
         return {
             "n": n,
             "median": ratios[n // 2],
@@ -738,7 +745,66 @@ class Database:
             "p90": ratios[min(n - 1, int(n * 0.9))],
             "best": ratios[0],
             "worst": ratios[-1],
+            "over_breakeven": over,
+            "over_breakeven_rate": over / n,
+            "breakeven": breakeven,
         }
+
+    def variant_breakdown(self, run_id: str | None = None,
+                          breakeven: float = 1.395) -> list[dict]:
+        """Fill rate and entry quality per stake, side by side.
+
+        A resting order is punished by queue position, not by depth: a smaller
+        order can fill far more often at the same price, which is the opposite
+        of how crossing behaves. That makes stake a variable worth testing
+        rather than a constant nobody questioned.
+
+        Read this WITHIN a price band, not pooled. The exchange minimum is a
+        share count, so a $1 order is unplaceable above 20c and the $1 arm
+        therefore holds cheaper tokens than the $3 arm. That is physical, not
+        fixable, and pooling the arms would compare stakes by comparing prices.
+        """
+        where, params = "", []
+        if run_id:
+            where, params = " AND run_id = ?", [run_id]
+
+        orders = self._all(
+            f"""SELECT stake_variant_usd AS v,
+                       COUNT(*) AS orders,
+                       SUM(filled_shares > 0) AS any_fill,
+                       COALESCE(SUM(filled_shares), 0) AS shares,
+                       COALESCE(SUM(target_shares), 0) AS target,
+                       SUM(alt_filled_shares > 0) AS alt_any_fill
+                FROM resting_orders
+                WHERE status != 'resting' AND stake_variant_usd IS NOT NULL{where}
+                GROUP BY v ORDER BY v""", params)
+
+        ratios: dict[float, list[float]] = {}
+        for row in self._all(
+            f"""SELECT stake_variant_usd AS v, our_avg_fill / his_vwap_entry AS ratio
+                FROM positions
+                WHERE our_avg_fill > 0 AND his_vwap_entry > 0
+                  AND stake_variant_usd IS NOT NULL{where}""", params):
+            ratios.setdefault(row["v"], []).append(row["ratio"])
+
+        out = []
+        for v in sorted(set(list(ratios) + [r["v"] for r in orders])):
+            o = next((r for r in orders if r["v"] == v), None)
+            rs = sorted(ratios.get(v, []))
+            n = len(rs)
+            out.append({
+                "stake": v,
+                "orders": (o["orders"] if o else 0),
+                "fill_rate": ((o["any_fill"] or 0) / o["orders"]) if o and o["orders"] else None,
+                "alt_fill_rate": ((o["alt_any_fill"] or 0) / o["orders"])
+                                 if o and o["orders"] else None,
+                "share_fill_rate": ((o["shares"] / o["target"]) if o and o["target"] else None),
+                "positions": n,
+                "mean_ratio": (sum(rs) / n) if n else None,
+                "median_ratio": rs[n // 2] if n else None,
+                "over_breakeven": sum(1 for r in rs if r > breakeven),
+            })
+        return out
 
     # -- shadow ladder -----------------------------------------------------
     def record_shadow_ladder(self, conn, rungs, *, trade=None, book=None,

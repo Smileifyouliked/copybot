@@ -163,6 +163,38 @@ def build_feed(db: Database, limit: int = 40, max_skips: int = 12) -> list[dict]
 
 # --- view model ------------------------------------------------------------
 
+def _ratio_bar(mean: float | None, breakeven: float) -> dict:
+    """Where our entry price sits between "his price" and "break-even".
+
+    Drawn on a fixed scale from 1.0 (we paid exactly what he paid) to 2.0, with
+    the break-even line at its true position. A bar that scales to the data
+    would move the break-even line around, which is the one thing on this page
+    that must never move.
+    """
+    top = 2.0
+    def pos(v):
+        return max(0.0, min(100.0, (v - 1.0) / (top - 1.0) * 100.0))
+    return {
+        "breakeven_pct": pos(breakeven),
+        "value_pct": pos(mean) if mean is not None else None,
+        "over": (mean is not None and mean > breakeven),
+    }
+
+
+def _conventions_diverge(fills: dict, tolerance: float = 0.1) -> bool:
+    """True when the two `side` readings disagree enough to matter.
+
+    They are not two estimates of one number. If the convention is inverted,
+    the configured reading is not conservative -- it is measuring a different
+    population -- so a gap between them means neither can be trusted until
+    `side-check` settles it.
+    """
+    a, b = fills.get("fill_rate"), fills.get("alt_fill_rate")
+    if a is None or b is None:
+        return False
+    return abs(a - b) > tolerance
+
+
 def build_state(cfg: Config, db: Database) -> dict:
     now = now_ts()
     cash = db.cash()
@@ -185,7 +217,10 @@ def build_state(cfg: Config, db: Database) -> dict:
             "held": held_for(now - row["opened_ts"]),
             "band": row["entry_band"],
         })
-    holdings.sort(key=lambda h: h["change"])
+    # Biggest holdings first: the question a non-trader asks of this table is
+    # "where is my money", and that is answered by what each bet is worth now,
+    # not by which one moved the most.
+    holdings.sort(key=lambda h: h["worth"], reverse=True)
 
     equity = cash + positions_value
     profit = equity - cfg.starting_capital_usd
@@ -210,6 +245,8 @@ def build_state(cfg: Config, db: Database) -> dict:
     }
 
     winners = expected_vs_actual_winners(db)
+    ratio = db.vwap_ratio_stats(breakeven=cfg.vwap_breakeven_ratio)
+    fills = db.fill_rate_stats()
     clv = clv_summary(db, cfg.clv_max_spread)
     depth = depth_cost_summary(db, f"${cfg.stake_per_copy_usd:g}")
     slippage = slippage_summary(db)
@@ -223,6 +260,11 @@ def build_state(cfg: Config, db: Database) -> dict:
         "holdings": holdings,
         "feed": build_feed(db),
         "winners": winners,
+        "ratio": ratio,
+        "ratio_bar": _ratio_bar(ratio.get("mean"), cfg.vwap_breakeven_ratio),
+        "fills": fills,
+        "fills_diverge": _conventions_diverge(fills),
+        "variants": db.variant_breakdown(breakeven=cfg.vwap_breakeven_ratio),
         "clv": clv,
         "clv_horizons": clv_at_horizons(db, cfg.clv_horizons_minutes),
         "depth": depth,
@@ -257,8 +299,7 @@ def create_app(cfg: Config) -> FastAPI:
         conn = db()
         try:
             state = build_state(cfg, conn)
-            state["request"] = request
-            return TEMPLATES.TemplateResponse("index.html", state)
+            return TEMPLATES.TemplateResponse(request, "index.html", state)
         finally:
             conn.close()
 

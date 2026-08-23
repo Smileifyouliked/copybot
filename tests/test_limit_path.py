@@ -276,3 +276,74 @@ def test_prints_on_our_own_token_still_fill_us(db, limit_cfg):
     s.clock = lambda: T0 + 120
     s.poll_resting_orders()
     assert db.open_position_for_token("TOK1") is not None
+
+
+# --- stake as a tested variable --------------------------------------------
+
+def test_each_token_keeps_its_stake_across_a_restart(db, cfg, tmp_path):
+    """The variant is assigned by hashing the token, so a restart cannot move a
+    token from one arm to the other and blur the comparison."""
+    import dataclasses
+    from copybot.db import Database
+    cfg = dataclasses.replace(cfg, entry_mode="limit")
+    path = tmp_path / "variants.sqlite3"
+    d1 = Database(path, cfg.starting_capital_usd)
+    s1, _, _ = build(d1, cfg, resting_book())
+    first = s1.stake_variant("TOK1")
+    d1.close()
+
+    d2 = Database(path, cfg.starting_capital_usd)
+    s2, _, _ = build(d2, cfg, resting_book())
+    assert s2.stake_variant("TOK1") == first
+    d2.close()
+
+
+def test_the_arms_are_spread_across_tokens(cfg):
+    """A hash that sent every token to one arm would produce a comparison of
+    one thing against nothing."""
+    import dataclasses
+    from copybot.db import Database
+    cfg = dataclasses.replace(cfg, entry_mode="limit")
+    s = Strategy(cfg, None, None, None, clock=lambda: T0)
+    counts = {}
+    for i in range(300):
+        v = s.stake_variant(f"token-{i}")
+        counts[v] = counts.get(v, 0) + 1
+    assert set(counts) == set(cfg.stake_variants_usd)
+    assert min(counts.values()) > 300 / len(cfg.stake_variants_usd) / 2
+
+
+def test_a_stake_too_small_to_place_moves_up_rather_than_out(db, cfg):
+    """At the 5-share minimum a $1 order is unplaceable above 20c. Skipping
+    those would drop the whole 20-30c band out of the $1 arm instead of
+    measuring it, so the token moves up to the smallest stake that fits."""
+    import dataclasses
+    cfg = dataclasses.replace(cfg, entry_mode="limit", stake_variants_usd=[1.00])
+    s, _, _ = build(db, cfg, resting_book(ask=0.31, limit=0.29))
+    book = s.executor.get_book("TOK1")
+    assert s.budget_for("TOK1", book, 0.02) == pytest.approx(1.00), \
+        "at 2c a $1 order is placeable and must stay in its own arm"
+    # At 29c the floor is 5 x 0.29 = $1.45 and no larger variant exists, so the
+    # budget falls back to the nominal and the fill is refused rather than
+    # silently doubled.
+    assert s.budget_for("TOK1", book, 0.29) == pytest.approx(1.00)
+
+    cfg3 = dataclasses.replace(cfg, stake_variants_usd=[1.00, 3.00])
+    s3, _, _ = build(db, cfg3, resting_book(ask=0.31, limit=0.29))
+    assert s3.budget_for("TOK1", s3.executor.get_book("TOK1"), 0.29) == 3.00
+
+
+def test_the_breakdown_reports_each_stake_separately(db, cfg):
+    import dataclasses
+    cfg = dataclasses.replace(cfg, entry_mode="limit", stake_variants_usd=[1.00])
+    s, _, _ = build(db, cfg, resting_book(), tape=[print_(0.20, 500.0, T0 + 30)])
+    s.process_trades([make_trade(price=0.20, ts=T0)])
+    s.clock = lambda: T0 + 60
+    s.poll_resting_orders()
+
+    rows = db.variant_breakdown()
+    assert len(rows) == 1
+    assert rows[0]["stake"] == pytest.approx(1.00)
+    assert rows[0]["orders"] == 1
+    assert rows[0]["fill_rate"] == pytest.approx(1.0)
+    assert rows[0]["positions"] == 1
