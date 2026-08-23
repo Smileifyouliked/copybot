@@ -102,6 +102,80 @@ PYTHONPATH=src .venv/bin/python -m copybot.main dashboard    # the dashboard
 
 ---
 
+## Starting a fresh run without losing the old one
+
+Run 1 (market orders) is the only baseline run 2 (limit orders) can be judged
+against, so **nothing here deletes it.** `archive` copies; moving the live file
+aside is a `mv`, never an `rm`.
+
+Copy-paste this whole block on the server, in this order:
+
+```bash
+cd ~/copybot
+
+# 1. STOP the bot first. Archiving a database a bot is still writing to is
+#    safe (the backup API handles it), but starting run 2 while run 1 is still
+#    polling would put two bots on one file -- the exact thing we just fixed.
+sudo systemctl stop copybot copybot-dashboard
+screen -ls                      # anything still listed? kill it before step 5
+ps aux | grep -c "[c]opybot.main run"    # must print 0
+
+# 2. CHECK run 1 before you touch it. Prints whether two bots ever wrote this
+#    file, when, and whether anything was actually damaged.
+PYTHONPATH=src .venv/bin/python -m copybot.main doctor | tee run1-health.txt
+
+# 3. ARCHIVE. Copies to data/copybot-<timestamp>.sqlite3 and leaves the
+#    original exactly where it is. Refuses to overwrite an existing archive.
+PYTHONPATH=src .venv/bin/python -m copybot.main archive
+
+# 4. MOVE the live file aside so run 2 starts on an empty ledger. This is the
+#    only step that touches run 1, and it is a move, not a delete. The -n flag
+#    makes mv refuse rather than clobber if the name is somehow taken.
+ls -la data/                                   # confirm the archive exists FIRST
+mv -n data/copybot.sqlite3 data/run1-market.sqlite3
+mv -n data/copybot.sqlite3-wal data/run1-market.sqlite3-wal 2>/dev/null || true
+mv -n data/copybot.sqlite3-shm data/run1-market.sqlite3-shm 2>/dev/null || true
+ls -la data/                                   # copybot.sqlite3 should be GONE
+
+# 5. UPDATE the code.
+git fetch origin main && git checkout main && git pull
+.venv/bin/pip install -q -r requirements.txt
+.venv/bin/python -m pytest -q                  # must say "passed", no failures
+grep '^entry_mode' config.yaml                 # must say "limit"
+
+# 6. START. The instance lock means this refuses to run if anything from
+#    step 1 is somehow still alive, rather than quietly sharing the file.
+sudo systemctl start copybot copybot-dashboard
+sleep 30
+PYTHONPATH=src .venv/bin/python -m copybot.main status
+```
+
+Then watch it:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m copybot.main report --watch
+```
+
+And once run 2 has a few days of data, compare the two runs on entry quality:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m copybot.main compare \
+    data/run1-market.sqlite3 data/copybot.sqlite3
+```
+
+### If something goes wrong
+
+Run 1 is in three places after this: the archive, `run1-market.sqlite3`, and
+whatever backups you keep. To go back to it, stop the bot and
+`mv data/run1-market.sqlite3 data/copybot.sqlite3`.
+
+`systemctl start` failing with `refusing to start: another copybot already
+holds ...` means step 1 did not finish — something is still running. Find it
+with `ps aux | grep [c]opybot` and stop it; do not delete the `.lock` file,
+which does nothing (the kernel owns the lock, not the file).
+
+---
+
 ## Reading it without a browser
 
 If you only work on the server itself — through the AWS browser console, say —

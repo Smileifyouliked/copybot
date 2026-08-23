@@ -99,3 +99,76 @@ def test_healthz_reports_the_ledger(paper_cfg):
         body = client.get("/healthz").json()
     assert body["reconciles"] is True
     assert "heartbeat_age_seconds" in body
+
+
+# --- what "you paid" means -------------------------------------------------
+
+def sell_most_of_it(db, cfg, token="TOK1"):
+    """Fund a token fully, then mirror a sell of most of it."""
+    books = {token: make_book(token_id=token, asks=[(0.05, 100_000)],
+                              bids=[(0.06, 100_000)])}
+    s = Strategy(cfg, db, FakeExecutor(books=books),
+                 FakeClient(books=books, metas={"0xcond1": make_meta()}),
+                 clock=lambda: T0, run_id="run-A")
+    for i in range(3):
+        s.process_trades([make_trade(token_id=token, price=0.05, shares=100.0,
+                                     tx=f"0x{i}", ts=T0 + i)])
+    s.process_trades([make_trade(token_id=token, side="SELL", price=0.06,
+                                 shares=240.0, tx="0xs", ts=T0 + 20)])
+    return s
+
+
+def test_paid_shows_what_went_in_not_what_is_left(paper_cfg):
+    """A $3.00 position he sold 80% back out of was reading as "paid $0.63".
+
+    cost_basis_usd is the basis of the shares STILL HELD -- a mirrored sell
+    releases the sold share of it. What we put in is cost_basis_opened, which
+    only ever grows. Printing the first one under the heading "you paid" makes
+    a normal partial exit look like an undersized order.
+    """
+    db = Database(paper_cfg.db_path, paper_cfg.starting_capital_usd)
+    sell_most_of_it(db, paper_cfg)
+    pos = db.open_position_for_token("TOK1")
+    assert pos["cost_basis_usd"] < 1.0, "the remaining basis really is small"
+    assert pos["cost_basis_opened"] == pytest.approx(3.00, abs=0.02)
+
+    state = build_state(paper_cfg, db)
+    holding = state["holdings"][0]
+    assert holding["paid"] == pytest.approx(3.00, abs=0.02), \
+        "'you paid' must be what we put in"
+    assert holding["still_held"] == pytest.approx(pos["cost_basis_usd"])
+    assert holding["part_sold"] is True
+    db.close()
+
+
+def test_up_down_is_measured_against_the_shares_still_held(paper_cfg):
+    """The money from the sold shares is already realised and already in cash.
+    Charging it against the position again would count it twice."""
+    db = Database(paper_cfg.db_path, paper_cfg.starting_capital_usd)
+    sell_most_of_it(db, paper_cfg)
+    state = build_state(paper_cfg, db)
+    h = state["holdings"][0]
+    assert h["change"] == pytest.approx(h["worth"] - h["still_held"])
+    assert abs(h["change"]) < 1.0, \
+        "a partial exit must not read as a near-total loss"
+    db.close()
+
+
+def test_a_position_never_sold_reads_the_same_both_ways(paper_cfg):
+    """The fix must not change the ordinary case."""
+    db = Database(paper_cfg.db_path, paper_cfg.starting_capital_usd)
+    buy(db, paper_cfg, "TOK1", price=0.05, his_price=0.05)
+    h = build_state(paper_cfg, db)["holdings"][0]
+    assert h["part_sold"] is False
+    assert h["paid"] == pytest.approx(h["still_held"])
+    db.close()
+
+
+def test_the_page_says_when_part_of_a_bet_is_already_sold(paper_cfg):
+    db = Database(paper_cfg.db_path, paper_cfg.starting_capital_usd)
+    sell_most_of_it(db, paper_cfg)
+    db.close()
+    with TestClient(create_app(paper_cfg)) as client:
+        page = client.get("/")
+    assert "part already sold" in page.text
+    assert "still in" in page.text

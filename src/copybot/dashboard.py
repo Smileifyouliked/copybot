@@ -205,13 +205,25 @@ def build_state(cfg: Config, db: Database) -> dict:
         mark = row["last_mark_price"] if row["last_mark_price"] is not None else row["our_avg_fill"]
         worth = row["shares"] * mark
         positions_value += worth
-        paid = row["cost_basis_usd"]
+        # What we PUT IN is cost_basis_opened, which only ever grows. The other
+        # column, cost_basis_usd, is the basis of the shares we still hold: a
+        # mirrored sell releases the sold share of it. Printing that one under
+        # the heading "you paid" made a position we funded with $3.00 read as
+        # "paid $0.63" once he sold most of it back out.
+        still_held = row["cost_basis_usd"]
+        paid = row["cost_basis_opened"] or still_held
+        part_sold = row["shares_opened"] and row["shares"] < row["shares_opened"] - 1e-9
         holdings.append({
             "question": row["question"] or row["token_id"][:20],
             "outcome": row["outcome"],
             "paid": paid,
+            "part_sold": bool(part_sold),
+            # Up/down is measured against the shares still held. The money from
+            # the sold shares is already realised and already in cash, so
+            # charging it against this position again would count it twice.
+            "still_held": still_held,
             "worth": worth,
-            "change": worth - paid,
+            "change": worth - still_held,
             "bought_at": cents(row["our_avg_fill"]),
             "now_at": cents(mark),
             "held": held_for(now - row["opened_ts"]),
