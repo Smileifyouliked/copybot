@@ -135,8 +135,15 @@ class PolymarketClient:
         return min(self.backoff_cap, raw) * (0.5 + random.random())  # full-ish jitter
 
     # -- activity ----------------------------------------------------------
-    def get_activity(self, wallet: str, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
-        """Newest-first list of the wallet's TRADE rows."""
+    def get_activity(self, wallet: str, limit: int = 100, offset: int = 0,
+                     seen_keys: set[str] | None = None) -> list[dict[str, Any]]:
+        """Newest-first list of the wallet's TRADE rows.
+
+        `seen_keys` lets the caller say which trades it has already processed.
+        If the OLDEST row on a full page is one of them, the page reaches back
+        past everything new and there is no gap, so the truncation warning is
+        noise rather than signal.
+        """
         data = self._request(
             "GET",
             f"{DATA_API}/activity",
@@ -149,7 +156,16 @@ class PolymarketClient:
         # an outage that is how his fill history develops holes -- which
         # corrupts his VWAP and the sell-mirroring fraction, even though the
         # trades themselves are too old to copy.
-        assert_complete_page(data, limit, what="data-api /activity")
+        covered = False
+        if seen_keys and data:
+            try:
+                from .models import TargetTrade
+                oldest = TargetTrade.from_activity(data[-1])
+                covered = oldest.trade_key in seen_keys
+            except (ValueError, KeyError, TypeError):
+                covered = False
+        assert_complete_page(data, limit, what="data-api /activity",
+                             covered=covered)
         return data
 
     # -- books -------------------------------------------------------------

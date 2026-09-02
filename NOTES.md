@@ -877,6 +877,100 @@ The verdict separates two things that a blanket pass/fail would blur: aggregate
 read as one bot's behaviour, while **per-fill entry quality** is each fill's own
 number against a real book and survives.
 
+## 11i. First 21 hours live: what the run actually said
+
+Exported bundle, 2026-09-02, 0.87 days of limit-mode running, 719 of his
+trades seen, 406 resting orders finished, 28 positions.
+
+### The headline number arrived fast, and it is bad
+
+**3% of resting orders got any fill. 0% of the shares we asked for.** Under the
+opposite `side` convention it is 1% -- so the convention ambiguity that S11b
+worried about is **moot at these numbers**: both readings say the same thing.
+That is worth banking. The experiment does not need `side-check` to answer its
+first question.
+
+At n=406 the standard error on a 3% rate is 0.85 points, so this is not a small
+sample being over-read. Resting at his exact price essentially does not fill.
+
+### The ratio was measuring the wrong thing
+
+The bundle showed our VWAP / his VWAP = **0.982 mean**, comfortably inside
+1.395, which reads as success. It is not.
+
+`entry_path` was passed to the recorder and never stored, so resting fills and
+crossed-inside fills were pooled into one number. They are not the same event:
+
+* a **rested** fill is at his price *by construction*, so it contributes
+  exactly 1.000 and tells you nothing you did not already know;
+* a **crossed-inside** fill is wherever the book had already moved to. The run
+  contains fills at 0.002 against his 0.151 -- a ratio of 0.013.
+
+A handful of those drag the pooled mean under 1.0 regardless of how the resting
+orders are doing. **The number that decides the project was a number about the
+mix.** Fixed: `entry_path` is now stored on every position and execution, and
+both reports split by it.
+
+### The adverse-selection hypothesis, tested and rejected
+
+The obvious reading of the P&L was that crossed-inside fills are adverse
+selection -- we only get filled when the market has already moved against him,
+so our bargains are bargains for a reason. The split looked damning:
+
+    at his price          13 bets   +$3.17
+    below his price        9 bets   -$1.47
+    above his price        5 bets   -$2.32
+
+**It does not survive the win counts.** Against the null that our entry price
+IS the probability, the below-his-price group expected 0.78 winners and got 1.
+That is dead on. The at-his-price group expected 2.11 and got 4 -- better, but
+n=13.
+
+The P&L gap is a **price-band artifact**, not selection: 0% of the 20-30c band
+came from crossing, while 83% of the 10-20c band did. Cheap tokens lose almost
+always; the crossing path is concentrated in cheap tokens; so the crossing path
+loses. That is arithmetic about where the two paths occur, not evidence that
+crossing picks losers.
+
+Recorded because the hypothesis was plausible, specific, and wrong, and the
+thing that killed it was counting expected winners rather than staring at P&L.
+
+### CLV is tracking toward a kill
+
+    +15min  -22.7% (n=22)
+    +60min  -37.1% mean, -48.7% median (n=20)
+    +360min  +8.3% (n=9)
+
+The kill condition is median CLV at +60min negative after 100 copies. It is at
+-48.7% with 35. Not fired, and not yet firable, but there is no reading of that
+number that is encouraging. Note the low-price confound: a 1c entry that
+resolves to 0.0015 is -85% CLV by construction, and the 0-10c band is where
+most copies are.
+
+## 11j. Three defects the first run exposed
+
+None were found by reading the code.
+
+1. **`entry_path` never persisted** (above). The experiment could not be read.
+
+2. **The tape was fetched once per ORDER.** A market has one tape however many
+   orders rest into it. 406 open orders re-fetching every 15s produced HTTP 429
+   from `/activity`, and the consequence is not local: a rate limit makes the
+   whole poll back off, his trades then age past `max_trade_age_seconds`, and
+   they are skipped. `trade_older_than_max_age` was the LARGEST skip category
+   at 82 -- a rate limit at the bottom of the stack became lost signals at the
+   top. Now cached per market for the duration of one pass, and only one pass:
+   an order can only fill on prints it has not seen yet.
+
+3. **The truncation guardrail fired on every poll: 57,604 of 66,677 log lines,
+   90% of the log.** `/activity` returns a full page of 100 every time, because
+   the wallet has more than 100 trades. A warning that fires every 15 seconds
+   forever is not a guardrail, it is a place for a real warning to hide -- the
+   same failure as the 103 false FEE FALLBACK warnings in S8b. The real risk it
+   was written for is a gap after downtime, so it now takes the keys we have
+   already processed: if the OLDEST row on a full page is one we have seen, the
+   page reaches back past everything new and there is no gap to warn about.
+
 ## 12. Still open
 
 - Whether a disputed UMA resolution can reverse a settlement we already booked.

@@ -96,6 +96,8 @@ class FakeExecutor:
         self.tape = tape or []
         self.ttl = ttl
         self.exclude_wallet = exclude_wallet
+        self.polls = []
+        self.passes = []
 
     def get_book(self, token_id):
         return self.books.get(token_id) or make_book(token_id=token_id)
@@ -121,9 +123,16 @@ class FakeExecutor:
 
     def poll_limit(self, order, now):
         from copybot import limits
+        self.polls.append(order.condition_id)
         return limits.apply_tape(order, self.tape, self.fee, now,
                                  require_sell_prints=True,
                                  exclude_wallet=self.exclude_wallet)
+
+    def begin_poll(self):
+        self.passes.append("begin")
+
+    def end_poll(self):
+        self.passes.append("end")
 
     def shadow_ladder(self, book, rungs, *, decision_ts=None):
         self.calls.append(("ladder", book.token_id, len(rungs)))

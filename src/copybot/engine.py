@@ -176,8 +176,13 @@ class Engine:
 
     # -- one pass ----------------------------------------------------------
     def poll_once(self) -> None:
+        # Hand the client what we have already processed, so a full page whose
+        # oldest row we have seen is recognised as covering the gap rather than
+        # warned about on every single poll.
+        known = self.db.processed_keys()
         rows = self.client.get_activity(
-            self.cfg.target_wallet, limit=self.cfg.activity_fetch_limit
+            self.cfg.target_wallet, limit=self.cfg.activity_fetch_limit,
+            seen_keys=known,
         )
         trades, malformed = [], 0
         for row in rows:
@@ -189,7 +194,6 @@ class Engine:
 
         # Cheap pre-filter: most rows on any given poll are ones we have already
         # seen, and this keeps the per-trade work proportional to what is new.
-        known = self.db.processed_keys()
         fresh = [t for t in trades if t.trade_key not in known]
 
         counters = self.strategy.process_trades(fresh)

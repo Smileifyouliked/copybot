@@ -341,6 +341,7 @@ class Strategy:
             else:
                 position_id = self.db.insert_position(
                     conn, run_id=self.run_id, stake_variant_usd=budget,
+                    entry_path=path,
                     token_id=trade.token_id, condition_id=trade.condition_id,
                     question=trade.title, outcome=trade.outcome,
                     outcome_index=trade.outcome_index,
@@ -376,7 +377,8 @@ class Strategy:
                 net_usd=fill.net_usd, levels_consumed=fill.levels_consumed,
                 fee_rate_used=fill.fee_rate_used,
                 fee_rate_was_fallback=1 if fill.fee_rate_was_fallback else 0,
-                entry_band=band, his_price=trade.price, his_ts=trade.traded_ts,
+                entry_band=band, entry_path=path,
+                his_price=trade.price, his_ts=trade.traded_ts,
                 his_vwap_at_copy=his_vwap, latency_seconds=latency,
                 size_ratio=(stake / trade.usd_size) if trade.usd_size > 0 else None,
                 slippage_vs_his_entry=slip_abs,
@@ -469,9 +471,18 @@ class Strategy:
                  stake, trade.price, trade.title[:44], order.queue_ahead_shares)
 
     def poll_resting_orders(self) -> dict[str, int]:
-        """Advance every resting order against the tape, and settle expiries."""
+        """Advance every resting order against the tape, and settle expiries.
+
+        The tape is fetched once per MARKET, not once per order. A market has
+        one tape however many orders we are resting into it, and fetching it
+        per order is what put the loop into HTTP 429 -- which backs the whole
+        poll off, which ages his trades past max_trade_age_seconds, which shows
+        up as skips. One rate limit at the bottom becomes lost signals at the
+        top.
+        """
         stats = {"resting": 0, "filled": 0, "partial": 0, "expired": 0}
         now = self._now()
+        self.executor.begin_poll()
         for row in self.db.open_resting():
             try:
                 order = self._rebuild_order(row)
@@ -499,6 +510,7 @@ class Strategy:
             except Exception:
                 log.exception("resting order %s failed to advance; continuing",
                               row["trade_key"])
+        self.executor.end_poll()
         return stats
 
     def _rebuild_order(self, row) -> "limits.RestingOrder":
@@ -563,6 +575,7 @@ class Strategy:
                 position_id = self.db.insert_position(
                     conn, run_id=self.run_id,
                     stake_variant_usd=row["stake_variant_usd"],
+                    entry_path="rested",
                     token_id=order.token_id, condition_id=order.condition_id,
                     question=order.question, outcome="", outcome_index=0,
                     status="open", opened_ts=ts,
@@ -590,7 +603,8 @@ class Strategy:
                 shares=gained_shares, avg_fill=order.limit_price,
                 gross_usd=gross, fee_usd=fee, net_usd=-(gross + fee),
                 levels_consumed=0, fee_rate_used=0.0, fee_rate_was_fallback=0,
-                entry_band=band, his_price=order.his_price,
+                entry_band=band, entry_path="rested",
+                his_price=order.his_price,
                 his_ts=order.placed_ts, his_vwap_at_copy=his_vwap,
                 latency_seconds=ts - order.placed_ts,
                 slippage_vs_his_entry=0.0, slippage_vs_his_entry_pct=0.0,

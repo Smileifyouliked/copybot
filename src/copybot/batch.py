@@ -90,17 +90,24 @@ def reconcile_batch(
     return by_id, missing, unexpected
 
 
-def assert_complete_page(rows: Sequence, limit: int, *, what: str) -> bool:
-    """Warn when a paged response came back exactly full.
+def assert_complete_page(rows: Sequence, limit: int, *, what: str,
+                         covered: bool = False) -> bool:
+    """Warn when a paged response came back exactly full AND that might matter.
 
     The set-reconciliation rule above covers calls that name what they want.
     A paged call names only a count, so its silent-omission failure mode is
     different: a full page means the server had at least as many rows as we
     asked for, and anything beyond the limit was dropped without a signal.
 
-    Returns True when the page is full (i.e. possibly truncated).
+    `covered` says the caller has independently established that the rows it
+    needed are inside the page -- a poller that has already seen the oldest row
+    on it has no gap, however full the page was. Without that distinction this
+    fired on every poll forever: 57,604 of 66,677 log lines in one 21-hour run,
+    which is not a guardrail, it is a place for a real warning to hide.
+
+    Returns True when the page is full AND uncovered (i.e. possibly truncated).
     """
-    if limit and len(rows) >= limit:
+    if limit and len(rows) >= limit and not covered:
         log.warning(
             "%s: returned a full page of %d, so older rows may exist beyond the "
             "limit and were not seen", what, len(rows),
