@@ -6,6 +6,7 @@ of lines were one warning, and HTTP 429s traced back to fetching the same tape
 once per order instead of once per market.
 """
 import dataclasses
+import pathlib
 
 import pytest
 
@@ -238,3 +239,61 @@ def test_positions_from_before_the_column_existed_are_labelled(db, limit_cfg):
     db.conn.execute("UPDATE positions SET entry_path = NULL")
     db.conn.commit()
     assert [p["path"] for p in db.path_breakdown()] == ["unrecorded"]
+
+
+# --- the health check has to answer the health question -------------------
+#
+# `status` exists to answer "is it alive right now". It was printing
+# `last heartbeat: 1788349347`, which does not answer that without arithmetic.
+
+def status_config(tmp_path, db_path, name="c.yaml"):
+    """The shipped config with db_path repointed at a scratch database."""
+    import yaml
+    raw = yaml.safe_load(pathlib.Path("config.yaml").read_text())
+    raw["db_path"] = str(db_path)
+    path = tmp_path / name
+    path.write_text(yaml.safe_dump(raw))
+    return path
+
+
+def run_status(tmp_path, db_path, capsys, name="c.yaml"):
+    from copybot.main import main
+    code = main(["status", "-c", str(status_config(tmp_path, db_path, name))])
+    return code, capsys.readouterr().out
+
+
+def test_status_reports_heartbeat_age_not_a_raw_epoch(cfg, tmp_path, capsys):
+    from copybot.db import Database
+    db_path = tmp_path / "alive.sqlite3"
+    d = Database(db_path, cfg.starting_capital_usd)
+    d.write_heartbeat(ok=True, note="fine")
+    d.close()
+
+    code, out = run_status(tmp_path, db_path, capsys)
+    assert code == 0
+    line = [l for l in out.splitlines() if l.startswith("last heartbeat")][0]
+    assert "ago" in line, f"an age, not an epoch: {line!r}"
+    assert "alive" in line
+    assert "UTC" in line, "the absolute time is still there for the record"
+
+
+def test_status_says_never_when_the_bot_has_not_run(cfg, tmp_path, capsys):
+    from copybot.db import Database
+    db_path = tmp_path / "empty.sqlite3"
+    Database(db_path, cfg.starting_capital_usd).close()
+
+    _, out = run_status(tmp_path, db_path, capsys, name="empty.yaml")
+    assert "never" in out and "has not run" in out
+
+
+def test_status_surfaces_a_failing_last_pass(cfg, tmp_path, capsys):
+    """A bot that is alive but failing every pass must not read as healthy."""
+    from copybot.db import Database
+    db_path = tmp_path / "bad.sqlite3"
+    d = Database(db_path, cfg.starting_capital_usd)
+    d.write_heartbeat(ok=False, error="PolymarketError: HTTP 500", note="failing")
+    d.close()
+
+    _, out = run_status(tmp_path, db_path, capsys, name="bad.yaml")
+    assert "last pass FAILED" in out
+    assert "HTTP 500" in out
