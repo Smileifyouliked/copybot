@@ -29,6 +29,7 @@ MAX_EXECUTIONS = 300
 MAX_POSITIONS = 200
 MAX_LOG_ISSUES = 80
 MAX_LOG_TAIL = 25
+MAX_RESTING = 120
 
 
 def _ts(value) -> str:
@@ -108,6 +109,90 @@ def build(cfg: Config, db: Database) -> str:
     L.append("```")
     L.append(render(cfg, db))
     L.append("```")
+    L.append("")
+
+    # ---- entry quality: the run-2 experiment -----------------------------
+    # This section is the point of the whole run. Market orders paid 11-197%
+    # worse than the wallet did against a break-even of our VWAP / his VWAP =
+    # 1.395, so entries now rest at his exact price and the question became
+    # "how often did we get in" rather than "how much worse did we pay".
+    L.append("## Entry quality (the experiment)")
+    L.append("")
+
+    L.extend(_tsv(
+        [[r["run_id"], r["entry_mode"], _ts(r["started_ts"]), r["git_commit"] or "-"]
+         for r in db.runs()],
+        ["run_id", "entry_mode", "started", "git_commit"]))
+    L.append("")
+
+    ratio = db.vwap_ratio_stats(breakeven=cfg.vwap_breakeven_ratio)
+    L.append("### our VWAP / his VWAP  (break-even "
+             f"{cfg.vwap_breakeven_ratio:.3f} -- above it his edge is spent on our entry)")
+    L.append(f"n_positions\t{ratio['n']}")
+    if ratio["n"]:
+        L.append(f"mean\t{_num(ratio['mean'], 4)}")
+        L.append(f"median\t{_num(ratio['median'], 4)}")
+        L.append(f"p90\t{_num(ratio['p90'], 4)}")
+        L.append(f"best\t{_num(ratio['best'], 4)}")
+        L.append(f"worst\t{_num(ratio['worst'], 4)}")
+        L.append(f"over_breakeven\t{ratio['over_breakeven']} of {ratio['n']}")
+        L.append(f"verdict\t{'OVER THE LINE' if ratio['mean'] > cfg.vwap_breakeven_ratio else 'inside the line'}")
+    L.append("")
+
+    fills = db.fill_rate_stats()
+    L.append("### Resting order fill rate")
+    L.append("Both `side` conventions are reported. They are NOT two estimates of")
+    L.append("one number: if the convention is inverted, the configured reading is")
+    L.append("measuring a different population, and the direction of the error is")
+    L.append("unknown. If they diverge, neither is usable until side-check settles it.")
+    L.append(f"orders_finished\t{fills['orders']}")
+    if fills["orders"]:
+        L.append(f"any_fill\t{fills['any_fill']}")
+        L.append(f"full_fill\t{fills['full_fill']}")
+        L.append(f"fill_rate_pct\t{_num(100 * fills['fill_rate'], 1)}")
+        L.append(f"full_fill_rate_pct\t{_num(100 * fills['full_fill_rate'], 1)}")
+        L.append(f"share_fill_rate_pct\t{_num(100 * (fills['share_fill_rate'] or 0), 1)}")
+        L.append(f"alt_fill_rate_pct\t{_num(100 * (fills['alt_fill_rate'] or 0), 1)}")
+        L.append(f"alt_share_fill_rate_pct\t{_num(100 * (fills['alt_share_fill_rate'] or 0), 1)}")
+        if fills["fill_rate"] is not None and fills["alt_fill_rate"] is not None:
+            gap = abs(fills["fill_rate"] - fills["alt_fill_rate"])
+            L.append(f"conventions_diverge\t{'YES' if gap > 0.1 else 'no'} "
+                     f"(gap {_num(100 * gap, 1)} points)")
+    L.append("")
+
+    variants = db.variant_breakdown(breakeven=cfg.vwap_breakeven_ratio)
+    if variants:
+        L.append("### By stake variant")
+        L.append("Compare WITHIN a price band, not pooled: the exchange minimum is a")
+        L.append("share count, so a $1 order is unplaceable above 20c and the arms")
+        L.append("therefore cover different price populations. That is physical.")
+        L.extend(_tsv(
+            [[_num(v["stake"], 2), v["orders"],
+              _num(100 * (v["fill_rate"] or 0), 1),
+              _num(100 * (v["share_fill_rate"] or 0), 1),
+              v["positions"], _num(v["mean_ratio"], 4), v["over_breakeven"]]
+             for v in variants],
+            ["stake_usd", "orders", "fill_rate_pct", "share_fill_rate_pct",
+             "positions", "mean_vwap_ratio", "over_breakeven"]))
+        L.append("")
+
+    resting = db.conn.execute(
+        """SELECT trade_key, question, limit_price, usd_budget, target_shares,
+                  queue_ahead_shares, filled_shares, alt_filled_shares,
+                  consumed_shares, prints_observed, status, placed_ts, expires_ts
+           FROM resting_orders ORDER BY placed_ts DESC LIMIT ?""",
+        (MAX_RESTING,)).fetchall()
+    L.append(f"### Resting orders (most recent {len(resting)})")
+    L.extend(_tsv(
+        [[_ts(r["placed_ts"]), r["status"], _num(r["limit_price"], 4),
+          _num(r["usd_budget"], 2), _num(r["target_shares"], 2),
+          _num(r["filled_shares"], 2), _num(r["alt_filled_shares"], 2),
+          _num(r["queue_ahead_shares"], 0), _num(r["consumed_shares"], 0),
+          r["prints_observed"], (r["question"] or "")[:44]]
+         for r in resting],
+        ["placed", "status", "limit_price", "usd_budget", "target_shares",
+         "filled_shares", "alt_filled_shares", "queue_ahead", "tape_volume",
+         "prints", "question"]))
     L.append("")
 
     # ---- aggregates ------------------------------------------------------
@@ -280,7 +365,7 @@ def build(cfg: Config, db: Database) -> str:
         L.append("```")
         L.append("")
 
-    restarts = Path("logs/restarts.log")
+    restarts = Path(cfg.log_path).parent / "restarts.log"
     if restarts.exists():
         lines = restarts.read_text(errors="replace").splitlines()
         L.append(f"### Crash restarts ({len(lines)})")
@@ -293,12 +378,19 @@ def build(cfg: Config, db: Database) -> str:
     rules = stopping_rules(db, cfg)
     L.append("## What I want to know")
     L.append("")
-    L.append("1. Is the depth cost at our stake size acceptable, or is our order")
-    L.append("   size the binding constraint rather than the wallet's selection?")
-    L.append("2. Is CLV positive, and is the closing-line capture rate high enough")
+    L.append("1. FILL RATE. Of his buys we tried to match, what fraction filled at")
+    L.append("   his price? If that is near zero, resting at his price does not get")
+    L.append("   us in, and the answer is 'his edge is unreachable' -- not 'try")
+    L.append("   harder'. Do the two `side` conventions agree? If not, nothing")
+    L.append("   below this line can be trusted yet.")
+    L.append(f"2. our VWAP / his VWAP against {cfg.vwap_breakeven_ratio:.3f}. Is it under the line,")
+    L.append("   and is it under the line on the MEAN as well as the median -- or is")
+    L.append("   an average being held up by a tail of terrible entries?")
+    L.append("3. Is CLV positive, and is the closing-line capture rate high enough")
     L.append("   to trust it?")
-    L.append("3. Are the skip reasons telling me the strategy is unreachable?")
-    L.append("4. Anything in the warnings that suggests the numbers are wrong")
+    L.append("4. Are the skip reasons telling me the strategy is unreachable, or")
+    L.append("   merely that the budget is small?")
+    L.append("5. Anything in the warnings that suggests the numbers are WRONG")
     L.append("   rather than merely disappointing?")
     L.append("")
     L.append(f"kill_conditions_breached\t{rules['breaches']}")
