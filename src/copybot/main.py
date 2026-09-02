@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import ConfigError, load_config
@@ -163,7 +164,22 @@ def main(argv: list[str] | None = None) -> int:
         print(f"realised P&L    : ${db.realised_pnl():+,.2f}")
         print(f"his trades seen : {len(db.processed_keys())}")
         print(f"reconciles      : {ok}  {parts if not ok else ''}")
-        print(f"last heartbeat  : {heartbeat['ts'] if heartbeat else 'never'}")
+
+        # A raw epoch is the one thing this line must not print. `status` is
+        # the health check -- it is run to answer "is it alive right now", and
+        # 1788349347 does not answer that without arithmetic.
+        from .db import now_ts
+        from .dashboard import ago
+        if heartbeat is None:
+            print("last heartbeat  : never — the bot has not run against this database")
+        else:
+            age = now_ts() - heartbeat["ts"]
+            state = "alive" if age < 60 else "STALLING" if age < 300 else "STOPPED"
+            stamp = datetime.fromtimestamp(heartbeat["ts"], timezone.utc)
+            print(f"last heartbeat  : {ago(age)} ({stamp:%Y-%m-%d %H:%M:%S UTC}) — {state}")
+            if not heartbeat["loop_ok"]:
+                print(f"                  last pass FAILED: "
+                      f"{(heartbeat['error'] or '')[:120]}")
         return 0 if ok else 1
     finally:
         db.close()
