@@ -104,6 +104,22 @@ def render(cfg: Config, db: Database) -> str:
                           " trades; run side-check." if gap > 0.1
                           else "   (the two readings agree)"))
 
+    paths = db.path_breakdown(breakeven=cfg.vwap_breakeven_ratio)
+    if paths:
+        out.append("  by HOW we got in — resting fills land at his price by")
+        out.append("  construction, so pooling them with fills the market handed")
+        out.append("  us after it moved makes one number about the mix, not about")
+        out.append("  execution:")
+        out.append("  how               bets   we pay   over line   staked   P&L")
+        label = {"rested": "waited at his px", "crossed_inside": "market came to us",
+                 "market": "crossed spread", "unrecorded": "(before this was logged)"}
+        for pth in paths:
+            out.append(
+                f"  {label.get(pth['path'], pth['path']):<18}{pth['n']:>4}   "
+                f"{pth['mean_ratio']:.3f}x   {pth['over_breakeven']:>4}/{pth['n']:<4}  "
+                f"{money(pth['staked_usd']):>7}  {money(pth['pnl_usd']):>7}")
+        out.append("")
+
     variants = db.variant_breakdown(breakeven=cfg.vwap_breakeven_ratio)
     if len(variants) > 1:
         out.append("  by bet size — a resting order is held up by the queue in front")

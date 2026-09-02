@@ -27,8 +27,9 @@ class StubClient(FakeClient):
         self.rows = list(rows)
         self.activity_calls = 0
 
-    def get_activity(self, wallet, limit=100):
+    def get_activity(self, wallet, limit=100, seen_keys=None):
         self.activity_calls += 1
+        self.seen_keys_passed = seen_keys
         return list(self.rows)
 
 

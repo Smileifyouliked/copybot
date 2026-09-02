@@ -108,6 +108,7 @@ CREATE TABLE IF NOT EXISTS positions (
     our_avg_fill         REAL NOT NULL,
     entry_fee_usd        REAL NOT NULL DEFAULT 0,
     entry_band           TEXT,
+    entry_path           TEXT,      -- rested | crossed_inside | market
     -- his side of the trade
     his_first_price      REAL,
     his_first_ts         INTEGER,
@@ -181,7 +182,8 @@ CREATE TABLE IF NOT EXISTS copied_trades (
     slippage_vs_his_entry     REAL,
     slippage_vs_his_entry_pct REAL,
     realised_pnl_usd     REAL,
-    note                 TEXT
+    note                 TEXT,
+    entry_path           TEXT       -- rested | crossed_inside | market
 );
 CREATE INDEX IF NOT EXISTS idx_ct_ts ON copied_trades(ts DESC);
 CREATE INDEX IF NOT EXISTS idx_ct_position ON copied_trades(position_id);
@@ -317,9 +319,13 @@ class Database:
             ("closing_line_captured", "INTEGER NOT NULL DEFAULT 0"),
             ("run_id", "TEXT"),
             ("stake_variant_usd", "REAL"),
+            ("entry_path", "TEXT"),
         ):
             if col not in have:
                 self._conn.execute(f"ALTER TABLE positions ADD COLUMN {col} {decl}")
+        trades = {r["name"] for r in self._conn.execute("PRAGMA table_info(copied_trades)")}
+        if "entry_path" not in trades:
+            self._conn.execute("ALTER TABLE copied_trades ADD COLUMN entry_path TEXT")
         shadow = {r["name"] for r in self._conn.execute("PRAGMA table_info(shadow_fills)")}
         if "unmeasurable_reason" not in shadow:
             self._conn.execute("ALTER TABLE shadow_fills ADD COLUMN unmeasurable_reason TEXT")
@@ -749,6 +755,48 @@ class Database:
             "over_breakeven_rate": over / n,
             "breakeven": breakeven,
         }
+
+    def path_breakdown(self, run_id: str | None = None,
+                       breakeven: float = 1.395) -> list[dict]:
+        """Entry quality split by HOW we got in.
+
+        Pooling these is what made the headline ratio unreadable. Resting fills
+        land at his exact price by construction, so they push the ratio to
+        1.000. Crossed-inside fills land wherever the book had already moved to,
+        which can be 98% below him -- and a handful of those drag the mean under
+        1.0 no matter how the resting orders are doing. One number over both is
+        a number about the mix, not about execution.
+        """
+        where, params = "WHERE our_avg_fill > 0 AND his_vwap_entry > 0", []
+        if run_id:
+            where += " AND run_id = ?"
+            params.append(run_id)
+        buckets: dict[str, list] = {}
+        for row in self._all(
+                f"""SELECT COALESCE(entry_path, 'unrecorded') AS p,
+                           our_avg_fill / his_vwap_entry AS ratio,
+                           cost_basis_opened AS staked,
+                           realised_pnl_usd AS pnl, status
+                    FROM positions {where}""", params):
+            buckets.setdefault(row["p"], []).append(row)
+
+        out = []
+        for path in sorted(buckets):
+            rows = buckets[path]
+            ratios = sorted(r["ratio"] for r in rows)
+            n = len(ratios)
+            closed = [r for r in rows if r["status"] == "closed"]
+            out.append({
+                "path": path,
+                "n": n,
+                "mean_ratio": sum(ratios) / n,
+                "median_ratio": ratios[n // 2],
+                "over_breakeven": sum(1 for r in ratios if r > breakeven),
+                "closed": len(closed),
+                "staked_usd": sum(r["staked"] or 0.0 for r in rows),
+                "pnl_usd": sum(r["pnl"] or 0.0 for r in closed),
+            })
+        return out
 
     def variant_breakdown(self, run_id: str | None = None,
                           breakeven: float = 1.395) -> list[dict]:

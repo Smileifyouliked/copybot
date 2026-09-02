@@ -48,6 +48,12 @@ class Executor(ABC):
     def poll_limit(self, order: "limits.RestingOrder", now: int) -> "limits.RestingOrder":
         """Advance a resting order against executed prints since it was placed."""
 
+    def begin_poll(self) -> None:
+        """Start a polling pass. Tapes fetched during it may be shared."""
+
+    def end_poll(self) -> None:
+        """End the pass and drop anything cached for it."""
+
 
 class PaperExecutor(Executor):
     """Fake money, real prices.
@@ -60,6 +66,15 @@ class PaperExecutor(Executor):
     def __init__(self, cfg: Config, client: PolymarketClient):
         self.cfg = cfg
         self.client = client
+        # Tapes fetched during one polling pass, keyed by conditionId. A market
+        # has one tape no matter how many orders we rest into it.
+        self._tape_cache: dict[str, list] | None = None
+
+    def begin_poll(self) -> None:
+        self._tape_cache = {}
+
+    def end_poll(self) -> None:
+        self._tape_cache = None
 
     def get_book(self, token_id: str) -> OrderBook:
         return self.client.get_book(token_id)
@@ -140,11 +155,18 @@ class PaperExecutor(Executor):
             log.warning("resting order on %s carries no conditionId; cannot "
                         "check the tape", order.token_id[:16])
             return order
-        try:
-            trades = self.client.get_trades(order.condition_id, limit=200)
-        except PolymarketError as exc:
-            log.warning("tape fetch failed for %s: %s", order.condition_id[:12], exc)
-            return order
+        cache = self._tape_cache
+        if cache is not None and order.condition_id in cache:
+            trades = cache[order.condition_id]
+        else:
+            try:
+                trades = self.client.get_trades(order.condition_id, limit=200)
+            except PolymarketError as exc:
+                log.warning("tape fetch failed for %s: %s",
+                            order.condition_id[:12], exc)
+                return order
+            if cache is not None:
+                cache[order.condition_id] = trades
         return limits.apply_tape(
             order, trades, self._fee_for_condition(order.condition_id), now,
             require_sell_prints=self.cfg.limit_fill_requires_sell_prints,

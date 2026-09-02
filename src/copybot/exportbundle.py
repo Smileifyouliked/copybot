@@ -160,6 +160,21 @@ def build(cfg: Config, db: Database) -> str:
                      f"(gap {_num(100 * gap, 1)} points)")
     L.append("")
 
+    paths = db.path_breakdown(breakeven=cfg.vwap_breakeven_ratio)
+    if paths:
+        L.append("### By how the fill was obtained")
+        L.append("Resting fills land at his exact price by construction, so pooling")
+        L.append("them with crossed-inside fills makes the headline ratio a number")
+        L.append("about the mix rather than about execution. Read these separately.")
+        L.extend(_tsv(
+            [[q["path"], q["n"], _num(q["mean_ratio"], 4), _num(q["median_ratio"], 4),
+              q["over_breakeven"], q["closed"], _num(q["staked_usd"], 2),
+              _num(q["pnl_usd"], 2)]
+             for q in paths],
+            ["entry_path", "positions", "mean_ratio", "median_ratio",
+             "over_breakeven", "closed", "staked_usd", "pnl_usd"]))
+        L.append("")
+
     variants = db.variant_breakdown(breakeven=cfg.vwap_breakeven_ratio)
     if variants:
         L.append("### By stake variant")
