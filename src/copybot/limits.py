@@ -45,7 +45,6 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
-from .fees import FeeModel
 from .models import OrderBook
 
 log = logging.getLogger(__name__)
@@ -107,12 +106,22 @@ class RestingOrder:
         return self.alt_filled_shares / self.target_shares
 
 
-def queue_ahead_shares(book: OrderBook, limit_price: float) -> float:
-    """Shares that must trade before ours, joining at the back of the queue.
+def queue_ahead_shares(book: OrderBook, limit_price: float,
+                       model: str = "back") -> float:
+    """Shares that must trade before ours.
 
-    Every bid at our price or better has priority: a better price is strictly
-    preferred by any seller, and equal prices were there first.
+    "back" (the default, and what the live model assumes): every bid at our
+    price or better has priority -- a better price is strictly preferred by any
+    seller, and equal prices were there first.
+
+    "front" is the optimistic counterfactual: only strictly better prices are
+    ahead of us, as if we were first in line at our own price. It exists so the
+    queue assumption can be tested rather than believed, and it is a knob, not
+    a default -- a run configured with it is measuring a different market than
+    the one we would trade.
     """
+    if model == "front":
+        return sum(l.size for l in book.bids if l.price > limit_price + 1e-12)
     return sum(l.size for l in book.bids if l.price >= limit_price - 1e-12)
 
 
@@ -127,6 +136,7 @@ def place(
     token_id: str = "",
     his_trade_key: str = "",
     question: str = "",
+    queue_model: str = "back",
 ) -> RestingOrder:
     """Create a resting buy at his exact fill price."""
     target = usd_budget / his_price if his_price > 0 else 0.0
@@ -138,7 +148,7 @@ def place(
         target_shares=target,
         placed_ts=now,
         expires_ts=now + ttl_seconds,
-        queue_ahead_shares=queue_ahead_shares(book, his_price),
+        queue_ahead_shares=queue_ahead_shares(book, his_price, queue_model),
         his_price=his_price,
         his_trade_key=his_trade_key,
         question=question,
@@ -159,7 +169,6 @@ def marketable(book: OrderBook, limit_price: float) -> bool:
 def apply_tape(
     order: RestingOrder,
     trades: Iterable[dict[str, Any]],
-    fee: FeeModel,
     now: int,
     *,
     require_sell_prints: bool = True,
@@ -170,6 +179,13 @@ def apply_tape(
     Only prints strictly inside the order's lifetime count -- a trade from
     before we placed cannot have filled us, and using one would be look-ahead
     in reverse.
+
+    No fee model is taken, deliberately: a maker fill pays nothing (every live
+    schedule sampled carries `takerOnly: true`), so there is nothing for one to
+    do here. Accepting one anyway cost a `fee_rate_for` lookup per order per
+    pass, which on a cache miss is two gamma requests and, on a market with no
+    fee schedule, a FEE FALLBACK warning -- the exact noise the empty-book case
+    in `executor._fee_for` goes out of its way to avoid, on a hotter path.
     """
     excluded = (exclude_wallet or "").lower()
     primary_label = "SELL" if require_sell_prints else "BUY"
@@ -220,8 +236,8 @@ def apply_tape(
         gained = filled - order.filled_shares
         order.filled_shares = filled
         order.filled_usd += gained * order.limit_price
-        # takerOnly: true on every live schedule sampled, so a maker fill is free.
-        order.fee_usd += 0.0
+        # `fee_usd` stays at zero: takerOnly is true on every live schedule
+        # sampled, so a maker fill is free.
 
     alt_reachable = max(0.0, order.alt_consumed_shares - order.queue_ahead_shares)
     order.alt_filled_shares = max(

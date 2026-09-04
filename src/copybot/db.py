@@ -7,8 +7,11 @@ here does not exist.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 import time
+import urllib.parse
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Sequence
@@ -286,9 +289,32 @@ def now_ts() -> int:
 
 
 class Database:
-    def __init__(self, path: str | Path, starting_capital_usd: float):
+    def __init__(self, path: str | Path, starting_capital_usd: float, *,
+                 read_only: bool = False):
+        """`read_only` opens the file without touching it.
+
+        Opening normally is a WRITE: the schema script (which sets
+        `journal_mode`), the ALTER TABLE migration pass and an INSERT OR IGNORE
+        all run on every construction. That is right for the bot, which owns
+        the file, and wrong for the dashboard, which builds a Database per HTTP
+        request -- every page view and every /healthz poll would then contend
+        for the writer lock on the one file this experiment's data lives in.
+        A reader that only reads takes no writer lock at all.
+        """
         self.path = Path(path)
         self.starting_capital_usd = float(starting_capital_usd)
+        self.read_only = False
+        if read_only and str(self.path) != ":memory:" and self.path.exists():
+            # A missing file has no schema to read, so a reader falls through
+            # to the normal path and creates one -- the dashboard is allowed to
+            # come up before the bot has ever run.
+            self._conn = sqlite3.connect(
+                f"file:{urllib.parse.quote(str(self.path))}?mode=ro",
+                uri=True, timeout=30.0, isolation_level=None,
+            )
+            self._conn.row_factory = sqlite3.Row
+            self.read_only = True
+            return
         if str(self.path) != ":memory:":
             self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.path), timeout=30.0, isolation_level=None)
@@ -382,6 +408,62 @@ class Database:
             ),
         )
         return cur.rowcount > 0
+
+    def record_malformed_activity(self, row: dict, detail: str) -> bool:
+        """Remember an unparseable /activity row so it is seen exactly once.
+
+        Returns True the first time a given row is recorded.
+
+        `/activity` returns the newest ~100 rows, so a permanently unparseable
+        one sits in the window for days and gets re-parsed on every poll. Left
+        unrecorded that is ~5,760 identical warnings a day -- the same
+        log-flooding failure `assert_complete_page` was written to stop, where
+        one warning took 57,604 of 66,677 lines. Recording it also puts it in
+        the skip taxonomy, which is where a row we cannot read belongs: it is
+        signal we dropped, and the analysis bundle should say so.
+
+        The key is the row's own content, so a genuinely new bad row is still
+        reported. Side is stored as MALFORMED rather than BUY/SELL: nothing
+        here is trustworthy enough to feed his VWAP or his open-share count,
+        and those queries filter on side.
+        """
+        try:
+            payload = json.dumps(row, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            payload = repr(row)
+        key = "malformed-" + hashlib.sha256(payload.encode()).hexdigest()[:32]
+
+        def _num(value) -> float:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return 0.0
+
+        with self.tx() as conn:
+            cur = conn.execute(
+                """INSERT OR IGNORE INTO processed_trade_ids
+                   (trade_key, tx_hash, token_id, condition_id, side, price,
+                    shares, usd_size, traded_ts, seen_ts, action, title)
+                   VALUES (?,?,?,?,'MALFORMED',?,?,?,?,?,'malformed',?)""",
+                (key, str(row.get("transactionHash") or ""),
+                 str(row.get("asset") or ""), str(row.get("conditionId") or ""),
+                 _num(row.get("price")), _num(row.get("size")),
+                 _num(row.get("usdcSize")), int(_num(row.get("timestamp"))),
+                 now_ts(), str(row.get("title") or "")),
+            )
+            if cur.rowcount == 0:
+                return False
+            conn.execute(
+                """INSERT INTO skipped_trades
+                   (trade_key, token_id, condition_id, question, side, his_price,
+                    his_ts, seen_ts, reason, detail)
+                   VALUES (?,?,?,?,'MALFORMED',?,?,?,?,?)""",
+                (key, str(row.get("asset") or ""),
+                 str(row.get("conditionId") or ""), str(row.get("title") or ""),
+                 _num(row.get("price")), int(_num(row.get("timestamp"))),
+                 now_ts(), SkipReason.MALFORMED_TRADE.value, detail),
+            )
+        return True
 
     def his_fills(self, token_id: str, side: str = Side.BUY.value,
                   up_to_ts: int | None = None) -> list[sqlite3.Row]:
@@ -481,14 +563,43 @@ class Database:
         would let four of his fills place four orders against a three-order
         budget, and the cap would only be breached later, on the tape, where
         nothing checks it.
+
+        Only LIVE orders count. 'partial' is a terminal state -- an order that
+        expired having filled part of its budget -- so its unfilled remainder
+        is money that will never be spent. Reserving it would retire that slice
+        of the token's budget permanently, with nothing left that could ever
+        release it, and `reconcile()` could not see the loss because no cash
+        moved.
         """
         row = self._one(
             "SELECT COALESCE(SUM(MAX(usd_budget - filled_usd, 0)), 0) AS s "
-            "FROM resting_orders WHERE token_id = ? "
-            "AND status IN ('resting', 'partial')",
+            "FROM resting_orders WHERE token_id = ? AND status = 'resting'",
             (token_id,),
         )
         return float(row["s"]) if row else 0.0
+
+    def total_resting_exposure(self) -> float:
+        """Every dollar committed to live resting orders, across all tokens.
+
+        The per-token figure above cannot answer "can we afford one more
+        order?", because the cash that funds it is shared by every token. Two
+        dozen orders each individually inside their own per-token cap can still
+        promise several times the account.
+        """
+        row = self._one(
+            "SELECT COALESCE(SUM(MAX(usd_budget - filled_usd, 0)), 0) AS s "
+            "FROM resting_orders WHERE status = 'resting'"
+        )
+        return float(row["s"]) if row else 0.0
+
+    def free_cash(self) -> float:
+        """Cash that is not already promised to a resting order.
+
+        `cash()` is derived from executed fills alone, so it counts a dollar as
+        free right up until the tape fills the order that spent it. Every gate
+        that decides whether to commit new money has to use this instead.
+        """
+        return self.cash() - self.total_resting_exposure()
 
     def committed_on_token(self, token_id: str) -> float:
         """Everything this token has claimed: cash spent plus resting exposure."""
@@ -1000,12 +1111,32 @@ class Database:
     def last_heartbeat(self) -> sqlite3.Row | None:
         return self._one("SELECT * FROM heartbeat ORDER BY ts DESC, id DESC LIMIT 1")
 
-    def prune_heartbeats(self, keep: int = 5000) -> None:
-        """t3.small: keep the table from growing without bound at 15s polls."""
+    HEARTBEAT_RETENTION_DAYS = 60
+
+    def prune_heartbeats(self, keep_days: int | None = None,
+                         max_rows: int = 1_000_000) -> None:
+        """Bound the table by AGE, not by row count.
+
+        A row cap looks like the same thing and is not. At a 15s poll 5,000
+        rows is 20.8 hours, and the two things this table exists to answer are
+        both longer than that: `days_without_stall` feeds a 30-day go-live gate
+        it could never reach, and the two-writer audit in `doctor.py` was
+        written for an overlap that ran 41 hours. Pruning by count silently
+        capped both at just under a day.
+
+        60 days at 15s is ~346k rows of a handful of columns -- tens of MB,
+        which the t3.small can carry. `max_rows` stays as a floor under a
+        pathological poll rate, set far above the retention window so it never
+        binds in normal running.
+        """
+        days = self.HEARTBEAT_RETENTION_DAYS if keep_days is None else keep_days
+        self._conn.execute(
+            "DELETE FROM heartbeat WHERE ts < ?", (now_ts() - int(days * 86400),)
+        )
         self._conn.execute(
             "DELETE FROM heartbeat WHERE id NOT IN "
             "(SELECT id FROM heartbeat ORDER BY id DESC LIMIT ?)",
-            (keep,),
+            (max_rows,),
         )
 
     def write_equity_snapshot(self, cash: float, positions_value: float,

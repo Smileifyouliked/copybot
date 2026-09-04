@@ -172,6 +172,7 @@ def render(cfg: Config, db: Database) -> str:
     out.append("")
 
     curve = capacity_curve(db)
+    horizons = clv_at_horizons(db, cfg.clv_horizons_minutes)
     out.append(rule("WHAT WOULD HAPPEN AT OTHER BET SIZES"))
     if not curve:
         out.append("  No paired signals yet.")
@@ -193,7 +194,7 @@ def render(cfg: Config, db: Database) -> str:
     cells = []
     if clv["mean_clv_pct"] is not None:
         cells.append(f"at the finish {clv['mean_clv_pct']:+.1f}%")
-    for h in clv_at_horizons(db, cfg.clv_horizons_minutes):
+    for h in horizons:
         if h["mean_clv_pct"] is not None:
             cells.append(f"+{h['horizon_minutes']}min {h['mean_clv_pct']:+.1f}% "
                          f"(n={h['measured']})")
@@ -205,7 +206,9 @@ def render(cfg: Config, db: Database) -> str:
     out.append("")
 
     # ---- stopping rule ---------------------------------------------------
-    rules = stopping_rules(db, cfg)
+    # Same three inputs the sections above already computed; `stopping_rules`
+    # recomputes them otherwise.
+    rules = stopping_rules(db, cfg, curve=curve, horizons=horizons, capture=clv)
     out.append(rule("YOUR STOPPING RULE"))
     if rules["breaches"]:
         out.append(f"  *** {rules['breaches']} KILL CONDITION BREACHED: "

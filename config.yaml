@@ -30,6 +30,10 @@ our_max_fill_price: 0.30       # our own fill must also be under this, or skip
 entry_mode: "limit"            # "limit" | "market"
 limit_order_ttl_seconds: 300   # how long an order rests before being cancelled
 limit_queue_model: "back"      # "back" = assume we join behind all resting size
+                               # at our price. "front" is the optimistic
+                               # counterfactual -- only strictly better prices
+                               # count as ahead of us -- and is for testing the
+                               # queue assumption, not for a run we'd trust.
 # Only seller-initiated prints consume our resting bid. The tape's `side`
 # convention could not be pinned down decisively. This setting drives the
 # position; the OPPOSITE reading is computed and stored alongside every order,

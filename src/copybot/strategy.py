@@ -172,20 +172,47 @@ class Strategy:
     # =====================================================================
     def _handle_buy(self, trade: TargetTrade, counters: PollCounters) -> None:
         # Cheap local gates first; the network call is the last thing we do.
+        age = self._now() - trade.traded_ts
+        fresh = age <= self.cfg.max_trade_age_seconds
+
         if trade.price >= self.cfg.max_entry_price:
+            # Above our traded universe -- but the band between max_entry_price
+            # and shadow_band_max_price is not a gap we accept, it is a band we
+            # decided against and promised to keep measuring. Returning here
+            # made `shadow_band_max_price` dead config: no ladder, no rows, and
+            # nothing to check the decision against later. So the book is
+            # fetched and laddered exactly as it would be for a copy, and only
+            # the money is withheld.
+            book = rungs = None
+            if fresh and trade.price < self.cfg.shadow_band_max_price:
+                book = self.executor.get_book(trade.token_id)
+                rungs = self.executor.shadow_ladder(
+                    book, self._ladder_rungs(trade), decision_ts=self._now()
+                )
             return self._skip(
                 trade, SkipReason.PRICE_ABOVE_MAX_ENTRY, counters,
                 f"he bought at {trade.price:.4f}, our max entry is "
-                f"{self.cfg.max_entry_price:.4f}",
+                f"{self.cfg.max_entry_price:.4f}"
+                + (f" (recorded as a shadow ladder: under the "
+                   f"{self.cfg.shadow_band_max_price:.2f} band ceiling)"
+                   if rungs else ""),
+                book=book, rungs=rungs,
             )
 
-        age = self._now() - trade.traded_ts
-        if age > self.cfg.max_trade_age_seconds:
+        if not fresh:
             return self._skip(
                 trade, SkipReason.TRADE_TOO_OLD, counters,
                 f"trade is {age}s old, max age is "
                 f"{self.cfg.max_trade_age_seconds}s (downtime catch-up)",
             )
+
+        # A book can outlive the market it belongs to. Between a halt and the
+        # book being torn down, a stale quote will happily fill a paper order
+        # that could never have been placed live -- and every one of those
+        # inflates the fill counts the go-live decision rests on.
+        closed_reason, closed_detail = self._market_state_skip(trade)
+        if closed_reason is not None:
+            return self._skip(trade, closed_reason, counters, closed_detail)
 
         # From here a book is worth fetching: the signal is in-universe and
         # fresh, so even if we decline to act, the capacity curve is real data.
@@ -217,17 +244,43 @@ class Strategy:
         # and the fills we are waiting for are cheaper ones.
         floor_usd = self._min_tranche_usd(book, trade.price)
         stake = 0.0
+        unplaceable = False
         if copies < self.cfg.max_copies_per_token and remaining > 0.01:
             schedule = self.cfg.stake_schedule
             shaped = budget * schedule[min(copies, len(schedule) - 1)]
             stake = min(max(shaped, floor_usd), remaining)
             if stake < floor_usd - 1e-9:
                 stake = 0.0  # what is left cannot be placed at this price
+                # Two different facts wear the same shape here. If the floor is
+                # bigger than the token's WHOLE budget, no tranche was ever
+                # placeable at this price and no money was involved. If it is
+                # only bigger than what remains, the budget really did run
+                # down. The first is not a budget outcome and must not be
+                # filed as one.
+                unplaceable = floor_usd > budget + 1e-9
 
         if stake <= 0.01:
-            reason = (SkipReason.ALREADY_AT_MAX_COPIES
-                      if copies >= self.cfg.max_copies_per_token
-                      else SkipReason.TOKEN_BUDGET_SPENT)
+            # Why we are not buying matters as much as that we are not. The
+            # three cases are different data: the slots are used up, the money
+            # is used up, or the exchange minimum at this price is larger than
+            # what the token has left -- which can be true on the very first
+            # fill, with nothing spent at all. Filing that third case under
+            # "budget already spent" attributes a whole class of unplaceable
+            # orders to exhaustion that never happened.
+            if copies >= self.cfg.max_copies_per_token:
+                reason = SkipReason.ALREADY_AT_MAX_COPIES
+                detail = (f"already put ${spent:.2f} of the ${budget:.2f} per-token "
+                          f"budget into this token across {copies} fill(s)")
+            elif unplaceable:
+                reason = SkipReason.BELOW_MIN_ORDER_SIZE
+                detail = (f"the {book.min_order_size:g}-share minimum costs "
+                          f"${floor_usd:.2f} at {trade.price:.4f}, more than this "
+                          f"token's entire ${budget:.2f} budget, so no order was "
+                          f"placeable ({copies} fill(s) so far, ${spent:.2f} spent)")
+            else:
+                reason = SkipReason.TOKEN_BUDGET_SPENT
+                detail = (f"already put ${spent:.2f} of the ${budget:.2f} per-token "
+                          f"budget into this token across {copies} fill(s)")
             log.debug("no tranche for %s: %d copies, $%.4f of $%.2f left, "
                       "floor $%.4f", trade.token_id[:16], copies, remaining,
                       budget, floor_usd)
@@ -235,12 +288,7 @@ class Strategy:
             # average entry keeps improving while ours is frozen, and that gap
             # is the whole point of tracking it -- so record the fill and
             # refresh the position's view of his side before skipping.
-            self._skip(
-                trade, reason, counters,
-                f"already put ${spent:.2f} of the ${budget:.2f} per-token budget "
-                f"into this token across {copies} fill(s)",
-                book=book, rungs=rungs,
-            )
+            self._skip(trade, reason, counters, detail, book=book, rungs=rungs)
             self._refresh_his_position(trade.token_id)
             return
 
@@ -252,11 +300,19 @@ class Strategy:
                 f"${spent:.4f} + ${stake:.4f} exceeds ${budget:.4f}"
             )
 
-        cash = self.db.cash()
+        # Free cash, not cash. `cash()` counts a dollar as available until the
+        # tape spends it, and a resting order spends nothing until it fills --
+        # so gating on it let every open order see the same balance as free and
+        # promise it again. Five $3 orders against $6 is not a hypothetical:
+        # each one passed this gate, and the tape then filled all five.
+        cash = self.db.free_cash()
         if cash < stake:
+            committed = self.db.total_resting_exposure()
             return self._skip(
                 trade, SkipReason.NOT_ENOUGH_CASH, counters,
-                f"free cash ${cash:.2f} is below the ${stake:.2f} needed for this fill",
+                f"free cash ${cash:.2f} is below the ${stake:.2f} needed for this "
+                f"fill" + (f" (${committed:.2f} is already committed to resting "
+                           f"orders)" if committed > 0.005 else ""),
                 book=book, rungs=rungs,
             )
 
@@ -279,6 +335,44 @@ class Strategy:
 
         return self._record_buy(trade, fill, stake, budget, decision_ts, counters,
                                 book, rungs, path="market")
+
+    def _market_state_skip(self, trade: TargetTrade) -> tuple[SkipReason | None, str]:
+        """Is this market still open for business?
+
+        The book alone cannot answer that. A halted or freshly resolved market
+        keeps serving its last book for a while, and a fill against it is a
+        fill we could never have had live -- so it does not just cost us a
+        trade, it corrupts the fill counts the go-live decision reads.
+
+        Metadata that cannot be fetched is not treated as consent. Every other
+        gamma-dependent path in this file refuses to guess when the answer is
+        missing (`check_resolutions` leaves a position open rather than invent
+        a settlement), and the entry gate does the same: no metadata, no copy,
+        recorded as its own skip reason so an outage shows up as an outage in
+        the taxonomy instead of as a quiet change in what we traded.
+        """
+        if not trade.condition_id:
+            return (SkipReason.NO_MARKET_METADATA,
+                    "his fill carries no conditionId, so the market's state "
+                    "cannot be checked")
+        try:
+            meta = self.client.get_markets([trade.condition_id]).get(trade.condition_id)
+        except Exception as exc:  # network/parse: same answer as no metadata
+            log.warning("market metadata lookup failed for %s: %s",
+                        trade.condition_id[:20], exc)
+            meta = None
+        if meta is None:
+            return (SkipReason.NO_MARKET_METADATA,
+                    f"gamma has no metadata for {trade.condition_id[:20]}, so "
+                    "we cannot confirm the market is still trading")
+        if meta.closed:
+            return (SkipReason.MARKET_CLOSED,
+                    "the market is closed; its book has not been torn down yet")
+        if meta.accepting_orders is False:
+            return (SkipReason.MARKET_CLOSED,
+                    "the market is not accepting orders; a live order could "
+                    "not have been placed here")
+        return (None, "")
 
     def _record_buy(self, trade: TargetTrade, fill, stake: float, budget: float,
                     decision_ts: int, counters: PollCounters, book, rungs,
@@ -486,10 +580,25 @@ class Strategy:
         for row in self.db.open_resting():
             try:
                 order = self._rebuild_order(row)
+                previously_filled = row["filled_shares"] or 0.0
+                previously_usd = row["filled_usd"] or 0.0
                 order = self.executor.poll_limit(order, now)
-                gained = order.filled_shares - (row["filled_shares"] or 0.0)
+                gained = order.filled_shares - previously_filled
                 if gained > 1e-9:
-                    self._book_limit_fill(order, gained, row)
+                    booked = self._book_limit_fill(order, gained, row)
+                    if booked < gained - 1e-9:
+                        # Cash ran out mid-fill. The order must be rewound to
+                        # what we could actually pay for, or the row says
+                        # "filled" for shares that were never bought: no
+                        # position, no ledger entry, and `gained` is zero on
+                        # every later poll, so they can never be booked. That
+                        # loses the shares AND reports a fill rate against
+                        # positions that do not exist -- the one number this
+                        # experiment turns on. Rewound, the remainder is simply
+                        # still reachable, and the next poll books it if cash
+                        # has freed up.
+                        order.filled_shares = previously_filled + booked
+                        order.filled_usd = previously_usd + booked * order.limit_price
 
                 if order.is_complete:
                     status = "filled"
@@ -532,8 +641,14 @@ class Strategy:
             alt_prints_observed=row["alt_prints_observed"] or 0,
         )
 
-    def _book_limit_fill(self, order, gained_shares: float, row) -> None:
-        """Turn an incremental resting fill into position and ledger rows."""
+    def _book_limit_fill(self, order, gained_shares: float, row) -> float:
+        """Turn an incremental resting fill into position and ledger rows.
+
+        Returns the shares actually booked, which is less than `gained_shares`
+        when cash ran short. The caller MUST rewind the order to that figure:
+        anything not booked here has no position and no ledger row behind it,
+        so persisting it as filled would delete those shares silently.
+        """
         ts = self._now()
         gross = gained_shares * order.limit_price
         fee = 0.0  # maker: takerOnly is true on every live schedule sampled
@@ -542,7 +657,7 @@ class Strategy:
             log.warning("resting fill on %s needs $%.2f but only $%.2f is free; "
                         "booking what we can afford", order.token_id[:16], gross, cash)
             if cash <= 0:
-                return
+                return 0.0
             gained_shares = cash / order.limit_price
             gross = cash
 
@@ -612,6 +727,7 @@ class Strategy:
             )
         log.info("FILL %.4f shares at %.4f (his price) on %s", gained_shares,
                  order.limit_price, (order.question or order.token_id)[:44])
+        return gained_shares
 
     def _ladder_rungs(self, trade: TargetTrade) -> list[tuple[str, float]]:
         """Fixed rungs plus his own size.
@@ -643,7 +759,12 @@ class Strategy:
         if his_vwap is None:
             return
         our_fill = position["our_avg_fill"]
-        stake = self.cfg.stake_per_copy_usd
+        # What we actually put in, not what the config's headline stake is. The
+        # per-token budget comes from `stake_variants_usd`, so a token on the
+        # $1 arm reported a ratio three times too large every time he added a
+        # fill we skipped -- overwriting the correct figure `_record_buy` had
+        # already computed from the real cost basis.
+        staked = position["cost_basis_opened"] or position["cost_basis_usd"] or 0.0
         with self.db.tx() as conn:
             self.db.update_position(
                 conn, position["id"],
@@ -652,7 +773,7 @@ class Strategy:
                 his_total_shares=his_shares,
                 his_total_usd=his_usd,
                 his_position_usd_total=his_usd,
-                size_ratio_vs_total=(stake / his_usd) if his_usd > 0 else None,
+                size_ratio_vs_total=(staked / his_usd) if his_usd > 0 else None,
                 slippage_vs_his_vwap=our_fill - his_vwap,
                 slippage_vs_his_vwap_pct=(
                     (our_fill - his_vwap) / his_vwap * 100.0 if his_vwap > 0 else None

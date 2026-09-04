@@ -329,7 +329,8 @@ class PolymarketClient:
             outcomes=outcomes,
             outcome_prices=tuple(prices),
             closed=bool(row.get("closed")),
-            accepting_orders=bool(row.get("acceptingOrders")),
+            accepting_orders=(None if row.get("acceptingOrders") is None
+                              else bool(row.get("acceptingOrders"))),
             fee_rate=fee_rate,
             fee_type=row.get("feeType"),
             fees_enabled=bool(row.get("feesEnabled")),

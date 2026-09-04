@@ -86,7 +86,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     from .db import Database
-    db = Database(cfg.db_path, cfg.starting_capital_usd)
+    # Every remaining command reads. Opening read-only keeps a report or an
+    # export off the writer's lock on the file the running bot owns -- and
+    # `report --watch` reopens on every refresh, so it is a loop of them.
+    db = Database(cfg.db_path, cfg.starting_capital_usd, read_only=True)
 
     if args.command == "doctor":
         from .doctor import diagnose, render
@@ -131,7 +134,8 @@ def main(argv: list[str] | None = None) -> int:
                 while True:
                     # Reopen so the reader always sees the writer's latest
                     # committed state rather than a stale snapshot.
-                    fresh = Database(cfg.db_path, cfg.starting_capital_usd)
+                    fresh = Database(cfg.db_path, cfg.starting_capital_usd,
+                                     read_only=True)
                     try:
                         body = render(cfg, fresh)
                     finally:

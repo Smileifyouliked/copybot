@@ -143,7 +143,8 @@ class PaperExecutor(Executor):
         book = book if book is not None else self.get_book(token_id)
         return limits.place(book, limit_price, usd_amount, now=now,
                             ttl_seconds=self.cfg.limit_order_ttl_seconds,
-                            token_id=token_id, **kw)
+                            token_id=token_id,
+                            queue_model=self.cfg.limit_queue_model, **kw)
 
     def poll_limit(self, order: limits.RestingOrder, now: int) -> limits.RestingOrder:
         """Advance the order using the market's own executed trades.
@@ -167,17 +168,15 @@ class PaperExecutor(Executor):
                 return order
             if cache is not None:
                 cache[order.condition_id] = trades
+        # No fee model is resolved here. A maker fill is free, so one would
+        # only be fed to a parameter that ignored it -- at the price of a
+        # `fee_rate_for` lookup per order per pass, and a FEE FALLBACK warning
+        # on every market without a fee schedule.
         return limits.apply_tape(
-            order, trades, self._fee_for_condition(order.condition_id), now,
+            order, trades, now,
             require_sell_prints=self.cfg.limit_fill_requires_sell_prints,
             exclude_wallet=self.cfg.target_wallet,
         )
-
-    def _fee_for_condition(self, condition_id: str) -> FeeModel:
-        rate, was_fallback = self.client.fee_rate_for(
-            condition_id, self.cfg.fee_rate_fallback)
-        return FeeModel(rate=rate, was_fallback=was_fallback,
-                        bps_override=self.cfg.fee_bps_override)
 
 
 class LiveExecutor(Executor):

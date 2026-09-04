@@ -30,18 +30,32 @@ def expected_vs_actual_winners(db: Database) -> dict:
     60 copies averaging 5c it is 3 ± 1.7, which is why a red P&L number on day
     12 says nothing at all.
     """
+    # The settlement's own price, not the position's proceeds. `proceeds_usd`
+    # accumulates every mirrored sell too, so a position he half-sold before
+    # the market resolved at zero still ends with proceeds above zero -- and
+    # counting that as a win biases the z-score, which is the primary early
+    # read, systematically towards "running better than chance".
     rows = db.conn.execute(
-        """SELECT our_avg_fill, proceeds_usd FROM positions
-           WHERE status='closed' AND exit_path='resolution'"""
+        """SELECT p.our_avg_fill AS our_avg_fill,
+                  (SELECT c.avg_fill FROM copied_trades c
+                    WHERE c.position_id = p.id AND c.side = 'SETTLE'
+                    ORDER BY c.ts DESC LIMIT 1) AS settle_value
+             FROM positions p
+            WHERE p.status='closed' AND p.exit_path='resolution'"""
     ).fetchall()
+    unmeasured = sum(1 for r in rows if r["settle_value"] is None)
+    rows = [r for r in rows if r["settle_value"] is not None]
     if not rows:
         return {"resolved": 0, "expected": 0.0, "actual": 0, "sd": 0.0,
-                "z": None, "verdict": "no resolved bets yet"}
+                "z": None, "unmeasured": unmeasured,
+                "verdict": "no resolved bets yet"}
 
     expected = sum(r["our_avg_fill"] for r in rows)
     variance = sum(r["our_avg_fill"] * (1 - r["our_avg_fill"]) for r in rows)
     sd = math.sqrt(variance)
-    actual = sum(1 for r in rows if (r["proceeds_usd"] or 0) > 0)
+    # Binary settlement: $1.00 or $0.00. The 0.5 cut is only there so a market
+    # that somehow settled between them is counted the way it paid.
+    actual = sum(1 for r in rows if r["settle_value"] >= 0.5)
     z = ((actual - expected) / sd) if sd > 0 else None
 
     if z is None:
@@ -57,8 +71,12 @@ def expected_vs_actual_winners(db: Database) -> dict:
     else:
         verdict = "slightly behind, still within noise"
 
+    # `unmeasured` is a resolution-closed position carrying no SETTLE row.
+    # Every position `_settle` closes has one, so this should be zero; it is
+    # reported rather than dropped so that if it is ever non-zero the gap is
+    # visible instead of quietly shrinking the sample.
     return {"resolved": len(rows), "expected": expected, "actual": actual,
-            "sd": sd, "z": z, "verdict": verdict,
+            "sd": sd, "z": z, "verdict": verdict, "unmeasured": unmeasured,
             "low": max(0.0, expected - 2 * sd), "high": expected + 2 * sd}
 
 
@@ -280,13 +298,24 @@ def days_without_stall(db: Database) -> float | None:
     return (rows[-1]["ts"] - last_break) / 86400.0
 
 
-def stopping_rules(db: Database, cfg) -> dict:
+def stopping_rules(db: Database, cfg, *, curve: list | None = None,
+                   horizons: list | None = None,
+                   capture: dict | None = None) -> dict:
     """Current standing against the kill and continue conditions.
 
     The thresholds were fixed while neutral. This renders where things stand
     against them so the decision is a reading, not an argument.
+
+    `curve`, `horizons` and `capture` let a caller that has already computed
+    them hand them in. Every renderer displays all three next to these rules,
+    and recomputing them here made each page load run the two most expensive
+    queries in the file twice: a full GROUP BY over `shadow_fills` plus a
+    re-scan bound per paired trade_key, and one `mark_nearest` per position per
+    horizon. `horizons` may be a wider set than the kill horizon; the matching
+    row is picked out below either way.
     """
-    curve = {r["rung"]: r for r in capacity_curve(db)}
+    curve = {r["rung"]: r
+             for r in (capacity_curve(db) if curve is None else curve)}
     stake_label = f"${cfg.stake_per_copy_usd:g}"
     paired = curve[stake_label]["paired_signals"] if stake_label in curve else 0
 
@@ -308,11 +337,22 @@ def stopping_rules(db: Database, cfg) -> dict:
             "progress": f"{paired} / {cfg.kill_depth_min_signals} paired signals",
         }
 
+    measured = (clv_at_horizons(db, [cfg.kill_clv_horizon_minutes])
+                if horizons is None else horizons)
     horizon = next(
-        (r for r in clv_at_horizons(db, [cfg.kill_clv_horizon_minutes])
+        (r for r in measured
          if r["horizon_minutes"] == cfg.kill_clv_horizon_minutes),
         None,
     )
+    if horizon is None and horizons is not None:
+        # The caller's horizons did not include the kill horizon, so it still
+        # has to be measured -- silently reporting "waiting" would turn a
+        # rendering detail into a kill condition that can never fire.
+        horizon = next(
+            (r for r in clv_at_horizons(db, [cfg.kill_clv_horizon_minutes])
+             if r["horizon_minutes"] == cfg.kill_clv_horizon_minutes),
+            None,
+        )
     copies = db.conn.execute(
         "SELECT COUNT(*) AS n FROM copied_trades WHERE side='BUY'"
     ).fetchone()["n"]
@@ -324,7 +364,7 @@ def stopping_rules(db: Database, cfg) -> dict:
     else:
         clv_status = "ok"
 
-    capture = clv_summary(db, cfg.clv_max_spread)
+    capture = clv_summary(db, cfg.clv_max_spread) if capture is None else capture
     failure_pct = (
         (1 - capture["capture_rate"]) * 100 if capture["capture_rate"] is not None else None
     )

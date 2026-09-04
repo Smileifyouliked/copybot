@@ -262,6 +262,11 @@ def build_state(cfg: Config, db: Database) -> dict:
     clv = clv_summary(db, cfg.clv_max_spread)
     depth = depth_cost_summary(db, f"${cfg.stake_per_copy_usd:g}")
     slippage = slippage_summary(db)
+    # Computed once and handed to `stopping_rules`, which needs all three and
+    # would otherwise recompute them -- the ladder GROUP BY and one
+    # mark-nearest query per position per horizon, twice per page load.
+    ladder = capacity_curve(db)
+    horizons = clv_at_horizons(db, cfg.clv_horizons_minutes)
 
     return {
         "cfg": cfg,
@@ -278,10 +283,11 @@ def build_state(cfg: Config, db: Database) -> dict:
         "fills_diverge": _conventions_diverge(fills),
         "variants": db.variant_breakdown(breakeven=cfg.vwap_breakeven_ratio),
         "clv": clv,
-        "clv_horizons": clv_at_horizons(db, cfg.clv_horizons_minutes),
+        "clv_horizons": horizons,
         "depth": depth,
-        "ladder": capacity_curve(db),
-        "rules": stopping_rules(db, cfg),
+        "ladder": ladder,
+        "rules": stopping_rules(db, cfg, curve=ladder, horizons=horizons,
+                                capture=clv),
         "unmeasurable": db.unmeasurable_ladder_counts(),
         "slippage": slippage,
         "bands": band_breakdown(db),
@@ -303,8 +309,12 @@ def create_app(cfg: Config) -> FastAPI:
     app = FastAPI(title="copybot", docs_url=None, redoc_url=None)
 
     def db() -> Database:
-        # One connection per request keeps the reader off the writer's thread.
-        return Database(cfg.db_path, cfg.starting_capital_usd)
+        # One connection per request keeps the reader off the writer's thread,
+        # and read_only keeps it off the writer's LOCK: constructing a Database
+        # normally re-runs the schema script, the migration pass and an INSERT
+        # OR IGNORE, so every page view and every /healthz poll would take a
+        # write lock on the live bot's one database file.
+        return Database(cfg.db_path, cfg.starting_capital_usd, read_only=True)
 
     @app.get("/", response_class=HTMLResponse)
     def index(request: Request):

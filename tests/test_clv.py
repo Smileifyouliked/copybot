@@ -153,18 +153,35 @@ def test_near_close_tightens_the_marking_interval(db, single_cfg):
 
 # --- Expected vs actual winners -------------------------------------------
 
+
+def _resolved_position(db, conn, token_id, *, won, proceeds=0.0):
+    """A position that rode to resolution, with the SETTLE row a real one has.
+
+    Winners are read off that row's price, not off `proceeds_usd`, because
+    proceeds also carry any mirrored sell made before the market resolved.
+    """
+    position_id = db.insert_position(
+        conn, token_id=token_id, condition_id="0xc", question="Q",
+        outcome="Yes", outcome_index=0, status="closed", opened_ts=1,
+        closed_ts=2, shares=60.0, shares_opened=60.0, cost_basis_usd=0.0,
+        cost_basis_opened=3.0, our_avg_fill=0.05, entry_band="0-10c",
+        exit_path="resolution",
+        proceeds_usd=(60.0 if won else 0.0) + proceeds,
+        realised_pnl_usd=(57.0 if won else -3.0),
+    )
+    db.insert_execution(
+        conn, position_id=position_id, token_id=token_id, condition_id="0xc",
+        question="Q", side="SETTLE", ts=2, shares=60.0,
+        avg_fill=1.0 if won else 0.0, gross_usd=60.0 if won else 0.0,
+        fee_usd=0.0, net_usd=60.0 if won else 0.0, entry_band="0-10c",
+    )
+    return position_id
+
 def test_expected_winners_is_the_sum_of_entry_prices(db, single_cfg):
     """Under the null, a copy entered at 5c wins 5% of the time."""
     with db.tx() as conn:
         for i in range(60):
-            db.insert_position(
-                conn, token_id=f"T{i}", condition_id="0xc", question="Q",
-                outcome="Yes", outcome_index=0, status="closed", opened_ts=1,
-                closed_ts=2, shares=60.0, shares_opened=60.0, cost_basis_usd=0.0,
-                cost_basis_opened=3.0, our_avg_fill=0.05, entry_band="0-10c",
-                exit_path="resolution", proceeds_usd=(60.0 if i < 3 else 0.0),
-                realised_pnl_usd=(57.0 if i < 3 else -3.0),
-            )
+            _resolved_position(db, conn, f"T{i}", won=i < 3, proceeds=57.0)
     stats = expected_vs_actual_winners(db)
     assert stats["resolved"] == 60
     assert stats["expected"] == pytest.approx(3.0)          # 60 × 0.05
@@ -179,13 +196,7 @@ def test_four_winners_out_of_sixty_is_still_noise(db, single_cfg):
     """A real edge would show ~4. That must NOT read as success."""
     with db.tx() as conn:
         for i in range(60):
-            db.insert_position(
-                conn, token_id=f"T{i}", condition_id="0xc", question="Q",
-                outcome="Yes", outcome_index=0, status="closed", opened_ts=1,
-                closed_ts=2, shares=60.0, shares_opened=60.0, cost_basis_usd=0.0,
-                cost_basis_opened=3.0, our_avg_fill=0.05, entry_band="0-10c",
-                exit_path="resolution", proceeds_usd=(60.0 if i < 4 else 0.0),
-            )
+            _resolved_position(db, conn, f"T{i}", won=i < 4)
     stats = expected_vs_actual_winners(db)
     assert stats["actual"] == 4
     assert stats["z"] < 1
