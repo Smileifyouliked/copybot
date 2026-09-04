@@ -58,7 +58,13 @@ class InstanceLock:
     def acquire(self) -> "InstanceLock":
         import fcntl
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._fh = open(self.path, "w")
+        # "a+" and not "w": opening for write TRUNCATES, and it happens before
+        # the flock, so the loser of the race erased the winner's pid on its way
+        # to being refused. The error then had no pid to name, the incumbent's
+        # own record was gone for the rest of its life, and the operator was
+        # left grepping ps for the process this file exists to identify.
+        # Truncation belongs after the lock is ours, not before we ask for it.
+        self._fh = open(self.path, "a+")
         try:
             fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
@@ -72,6 +78,8 @@ class InstanceLock:
                     + " -- stop it before starting this one"
                 ) from exc
             raise
+        self._fh.seek(0)
+        self._fh.truncate()
         self._fh.write(f"{os.getpid()}\n")
         self._fh.flush()
         return self
@@ -190,7 +198,12 @@ class Engine:
                 trades.append(TargetTrade.from_activity(row))
             except ValueError as exc:
                 malformed += 1
-                log.warning("malformed activity row skipped: %s", exc)
+                # Recorded, not just logged: the row stays in the /activity
+                # window for days, so warning without remembering re-warns on
+                # every poll forever, and a dropped signal that appears in no
+                # skip count is a hole in the taxonomy the analysis reads.
+                if self.db.record_malformed_activity(row, str(exc)):
+                    log.warning("malformed activity row skipped: %s", exc)
 
         # Cheap pre-filter: most rows on any given poll are ones we have already
         # seen, and this keeps the per-trade work proportional to what is new.

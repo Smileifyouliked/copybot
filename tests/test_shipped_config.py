@@ -143,11 +143,38 @@ def test_entry_above_the_cap_is_refused(db, shipped):
 
 def test_shadow_band_signal_records_a_ladder_without_spending(db, shipped):
     """35c is outside the traded universe but inside the shadow band, so it
-    must still leave measurements behind."""
+    must still leave measurements behind.
+
+    "No buys and unchanged cash" is what a plain return does too, so asserting
+    only that let the band go unmeasured for the whole of run 2. The rows are
+    the point: `shadow_band_max_price` is a promise to keep measuring what we
+    decided not to trade.
+    """
     s, _, _ = build(db, shipped, 0.35)
     s.process_trades([make_trade(price=0.35, ts=T0)])
     assert buys(db) == []
     assert db.cash() == pytest.approx(shipped.starting_capital_usd)
+
+    rows = db.conn.execute(
+        "SELECT rung_label, outcome, his_price FROM shadow_fills"
+    ).fetchall()
+    assert rows, "a signal inside the shadow band must record a ladder"
+    assert {r["outcome"] for r in rows} == {
+        f"skipped:{SkipReason.PRICE_ABOVE_MAX_ENTRY.value}"
+    }
+    assert all(r["his_price"] == pytest.approx(0.35) for r in rows)
+    assert {f"${usd:g}" for usd in shipped.shadow_ladder_usd} <= {
+        r["rung_label"] for r in rows
+    }
+
+
+def test_above_the_shadow_band_records_nothing(db, shipped):
+    """The band has a ceiling, and above it we do not even fetch a book."""
+    s, ex, _ = build(db, shipped, 0.60)
+    s.process_trades([make_trade(price=0.60, ts=T0)])
+    assert db.recent_skips()[0]["reason"] == SkipReason.PRICE_ABOVE_MAX_ENTRY.value
+    assert db.conn.execute("SELECT COUNT(*) AS n FROM shadow_fills").fetchone()["n"] == 0
+    assert ex.calls == []
 
 
 # --- full lifecycle --------------------------------------------------------

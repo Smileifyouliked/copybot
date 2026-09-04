@@ -289,7 +289,11 @@ class MarketMeta:
     outcomes: tuple[str, ...]
     outcome_prices: tuple[float, ...]
     closed: bool
-    accepting_orders: bool
+    # None when gamma did not report the field at all. A missing flag is not
+    # the same claim as `false` -- coercing the absence to False would read
+    # every market as halted -- so the distinction is kept and the entry gate
+    # only acts on an explicit `false`.
+    accepting_orders: bool | None
     fee_rate: float | None
     fee_type: str | None
     fees_enabled: bool

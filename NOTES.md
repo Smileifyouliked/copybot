@@ -971,6 +971,130 @@ None were found by reading the code.
    already processed: if the OLDEST row on a full page is one we have seen, the
    page reaches back past everything new and there is no gap to warn about.
 
+## 11k. What a code review of run 2 found
+
+Fifteen defects, from reading the code rather than a bundle. Four of them
+changed numbers the experiment is decided on; the rest were dead knobs,
+mis-filed skips and wasted work. Grouped by what was actually wrong.
+
+**Money that was promised twice, and shares that vanished.**
+
+`db.cash()` is derived from executed fills, so a resting order spends nothing
+until the tape fills it -- and every gate that asked "can we afford this?"
+therefore saw the same dollar as free once per open order. With \$6 of capital,
+five \$3 orders rested on five tokens; each one passed the gate. When the tape
+filled all five, `_book_limit_fill` ran out of cash and returned early, but
+`poll_resting_orders` persisted every order as fully filled anyway. Those
+shares had no position and no ledger row, and on the next poll
+`gained = filled_shares - row["filled_shares"]` was zero, so they could never
+be booked. The run reported 5/5 orders filled and a 100% share fill rate
+against two actual positions, and `reconcile()` stayed green throughout,
+because no cash had moved.
+
+Both halves are fixed. `db.free_cash()` = cash minus every live resting order,
+and the pre-rest gate uses it. `_book_limit_fill` returns what it managed to
+book, and the caller rewinds the order to that -- so an order that could not be
+paid for stays partly unfilled, and the remainder is booked on a later poll if
+cash frees up. Fill rate is the one number this run exists to produce; it now
+counts only fills that became positions.
+
+**A dead order reserved its budget forever.** `resting_exposure` counted
+`status='partial'`, but `partial` is terminal -- an order that expired having
+filled part of its budget. Its unfilled remainder was reserved against the
+token's cap with nothing left that could ever release it, and `reconcile()`
+could not see the loss because no cash moved. Only `resting` counts now.
+
+**Winners were counted from proceeds.** `expected_vs_actual_winners` called a
+resolution a winner when `proceeds_usd > 0`, but proceeds also carry every
+mirrored partial sell. With `mirror_partial_sells: true`, a position he half
+sold before the market resolved at \$0.00 ended with proceeds above zero and
+was counted as a win. The z-score -- the primary read before 700 resolved
+copies -- therefore ran systematically better than reality. It now reads the
+SETTLE execution's own price. Resolution-closed positions with no SETTLE row
+are reported as `unmeasured` rather than dropped silently.
+
+**The size ratio was overwritten with a constant.** `_record_buy` writes
+`size_ratio_vs_total` from the real cost basis; `_refresh_his_position`, which
+runs on every later fill of his that we skip -- the common case, he averages ~5
+fills per token -- recomputed it from `cfg.stake_per_copy_usd`. Under
+`stake_variants_usd: [1, 2, 3]` that is wrong for every token not on the \$3
+arm. It uses the position's own cost basis now.
+
+**Two promises the config made and the code did not keep.**
+
+`shadow_band_max_price: 0.50` says the 30-50c band is "recorded as shadow rows
+... so the band's behaviour at our fill prices is measured rather than left as
+a gap". `_handle_buy` returned at the price gate before fetching a book, so the
+setting was read only by `config._validate` and the band produced zero rows for
+the whole of run 2. The test that claimed to cover it asserted no buys and
+unchanged cash -- which is exactly what a plain `return` does. In-band signals
+now fetch and ladder a book like any other, and only the money is withheld.
+
+`limit_queue_model` was validated as `back`/`front` and read by nothing:
+`queue_ahead_shares` always summed every bid at or better than the limit. An
+operator setting `front` got a run recorded in the `runs` table as having used
+a rule that was never applied. `front` is wired now -- only strictly better
+prices count as ahead of us -- and remains a counterfactual for testing the
+queue assumption, not a setting for a run we would trust.
+
+**Skips that told the wrong story.** A first fill on a token whose exchange
+minimum costs more than the token's entire budget was filed as
+`per_token_budget_already_spent`, with a detail reading "already put \$0.00 of
+the \$1.00 budget". `SkipReason.BELOW_MIN_ORDER_SIZE` exists for exactly that
+and is now used when the floor exceeds the whole budget; when it only exceeds
+what remains, the budget really did run down and the old reason is still right.
+
+A malformed `/activity` row was warned about and never recorded, so it re-warned
+on every 15s poll for as long as it sat in the newest-100 window: ~5,760
+identical lines a day, the same log-flooding failure S11j.3 was written to stop.
+`SkipReason.MALFORMED_TRADE` was declared and never raised, so unreadable rows
+appeared in no skip count at all. They are now recorded once, keyed by content,
+and appear in the taxonomy.
+
+**The buy path never asked whether the market was open.** `MarketMeta.closed`
+and `accepting_orders` were parsed and read nowhere; `MARKET_CLOSED` and
+`NO_MARKET_METADATA` were declared and never raised. A book outlives the market
+it belongs to -- the window between a halt and the book being torn down -- so a
+stale quote could open a paper position that could never have been placed live,
+inflating the fill counts the go-live decision rests on. The gate now runs
+before the book fetch, and metadata that cannot be fetched is not read as
+consent: no metadata, no copy, recorded as its own reason so an outage looks
+like an outage. `acceptingOrders` is parsed as tri-state, because gamma omitting
+the field is not gamma saying `false`.
+
+**The heartbeat table was pruned by count, which is not the same as by age.**
+`prune_heartbeats(keep=5000)` is 20.8 hours at a 15s poll. Both things that
+table exists to answer are longer: `days_without_stall` structurally capped at
+0.87 against `go_live_min_stable_days: 30`, so `go_live.ready` could never
+become true however long the bot ran, and `doctor.concurrent_writer_windows`
+could no longer show the 41-hour overlap it was written to audit (S11h).
+Retention is 60 days now, with a row cap far above it as a floor.
+
+**The instance lock destroyed the evidence it existed to provide.**
+`acquire()` opened the lock file with mode `"w"`, which truncates -- before the
+`flock`. So the loser of the race erased the incumbent's pid on its way to being
+refused, the error had no pid to name, and `cat copybot.sqlite3.lock` was empty
+for the rest of the incumbent's life. Opened `"a+"` now, truncated only after
+the lock is ours.
+
+**Work done twice, and work done for nothing.** `build_state` computed
+`clv_summary`, `capacity_curve` and `clv_at_horizons` and then called
+`stopping_rules`, which recomputed all three -- a full GROUP BY over
+`shadow_fills` plus one `mark_nearest` query per position per horizon, twice per
+page load, in `textreport` too. They are passed in now. `poll_limit` resolved a
+`FeeModel` per order per pass for `apply_tape`, which never used it; on a cache
+miss that is two gamma requests, and on a market with no fee schedule a WARN --
+the exact noise `_fee_for` suppresses for empty books, on a hotter path. The
+parameter is gone: a maker fill is free.
+
+**The dashboard took a write lock on the bot's database on every page load.**
+`Database.__init__` runs the schema script, the ALTER TABLE migration pass and
+an `INSERT OR IGNORE`, and the dashboard builds one per HTTP request -- so a
+`/healthz` poller generated sustained write traffic against the file holding the
+experiment's only copy of the data. `Database(..., read_only=True)` opens
+`mode=ro` and touches nothing; a missing file still falls through to the normal
+path, so the dashboard can come up before the bot has ever run.
+
 ## 12. Still open
 
 - Whether a disputed UMA resolution can reverse a settlement we already booked.

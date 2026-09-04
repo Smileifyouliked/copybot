@@ -59,14 +59,14 @@ def test_ask_touching_our_price_is_not_a_fill():
     mean anyone traded, and it does not move us up the queue."""
     b = book(bids=[(0.03, 100)], asks=[(0.03, 5000)])
     o = order(b, his_price=0.03)
-    limits.apply_tape(o, [], NO_FEE, T0 + 60)
+    limits.apply_tape(o, [], T0 + 60)
     assert o.filled_shares == 0.0
     assert o.fill_fraction == 0.0
 
 
 def test_no_prints_means_no_fill():
     o = order(book(bids=[(0.03, 10)]), his_price=0.03)
-    limits.apply_tape(o, [], NO_FEE, T0 + 299)
+    limits.apply_tape(o, [], T0 + 299)
     assert o.filled_shares == 0.0
     assert "unfilled" in limits.describe(o)
 
@@ -76,7 +76,7 @@ def test_no_prints_means_no_fill():
 def test_queue_must_clear_before_we_fill():
     """100 ahead of us. 80 trades through -> still nothing for us."""
     o = order(book(bids=[(0.03, 100)]), his_price=0.03)
-    limits.apply_tape(o, [print_(0.03, 80, T0 + 10)], NO_FEE, T0 + 20)
+    limits.apply_tape(o, [print_(0.03, 80, T0 + 10)], T0 + 20)
     assert o.consumed_shares == pytest.approx(80)
     assert o.filled_shares == 0.0
 
@@ -84,7 +84,7 @@ def test_queue_must_clear_before_we_fill():
 def test_fill_starts_once_the_queue_is_consumed():
     """100 ahead, 160 trades through -> 60 shares reach us."""
     o = order(book(bids=[(0.03, 100)]), his_price=0.03)   # target 100 shares
-    limits.apply_tape(o, [print_(0.03, 160, T0 + 10)], NO_FEE, T0 + 20)
+    limits.apply_tape(o, [print_(0.03, 160, T0 + 10)], T0 + 20)
     assert o.filled_shares == pytest.approx(60)
     assert o.filled_usd == pytest.approx(60 * 0.03)
     assert o.fill_fraction == pytest.approx(0.60)
@@ -93,7 +93,7 @@ def test_fill_starts_once_the_queue_is_consumed():
 
 def test_fill_never_exceeds_the_order():
     o = order(book(bids=[(0.03, 100)]), his_price=0.03)   # target 100
-    limits.apply_tape(o, [print_(0.03, 10_000, T0 + 5)], NO_FEE, T0 + 10)
+    limits.apply_tape(o, [print_(0.03, 10_000, T0 + 5)], T0 + 10)
     assert o.filled_shares == pytest.approx(100)
     assert o.is_complete
     assert "filled" in limits.describe(o)
@@ -101,16 +101,16 @@ def test_fill_never_exceeds_the_order():
 
 def test_no_queue_means_immediate_participation():
     o = order(book(bids=[]), his_price=0.03)
-    limits.apply_tape(o, [print_(0.03, 40, T0 + 5)], NO_FEE, T0 + 10)
+    limits.apply_tape(o, [print_(0.03, 40, T0 + 5)], T0 + 10)
     assert o.filled_shares == pytest.approx(40)
 
 
 def test_fills_accumulate_across_polls():
     o = order(book(bids=[(0.03, 50)]), his_price=0.03)
-    limits.apply_tape(o, [print_(0.03, 70, T0 + 10)], NO_FEE, T0 + 15)
+    limits.apply_tape(o, [print_(0.03, 70, T0 + 10)], T0 + 15)
     assert o.filled_shares == pytest.approx(20)
     limits.apply_tape(o, [print_(0.03, 70, T0 + 10), print_(0.03, 30, T0 + 40)],
-                      NO_FEE, T0 + 45)
+                      T0 + 45)
     assert o.filled_shares == pytest.approx(50)
 
 
@@ -118,7 +118,7 @@ def test_fills_accumulate_across_polls():
 
 def test_prints_above_our_limit_are_ignored():
     o = order(book(bids=[]), his_price=0.03)
-    limits.apply_tape(o, [print_(0.05, 1000, T0 + 10)], NO_FEE, T0 + 20)
+    limits.apply_tape(o, [print_(0.05, 1000, T0 + 10)], T0 + 20)
     assert o.filled_shares == 0.0
 
 
@@ -126,20 +126,20 @@ def test_prints_below_our_limit_do_count():
     """A seller taking 0.02 would have preferred our 0.03 bid, so that volume
     passed through our price level."""
     o = order(book(bids=[]), his_price=0.03)
-    limits.apply_tape(o, [print_(0.02, 40, T0 + 10)], NO_FEE, T0 + 20)
+    limits.apply_tape(o, [print_(0.02, 40, T0 + 10)], T0 + 20)
     assert o.filled_shares == pytest.approx(40)
 
 
 def test_prints_before_placement_are_ignored():
     """Using them would be look-ahead in reverse."""
     o = order(book(bids=[]), his_price=0.03)
-    limits.apply_tape(o, [print_(0.03, 500, T0 - 60)], NO_FEE, T0 + 20)
+    limits.apply_tape(o, [print_(0.03, 500, T0 - 60)], T0 + 20)
     assert o.filled_shares == 0.0
 
 
 def test_prints_after_expiry_are_ignored():
     o = order(book(bids=[]), his_price=0.03, ttl=300)
-    limits.apply_tape(o, [print_(0.03, 500, T0 + 900)], NO_FEE, T0 + 1000)
+    limits.apply_tape(o, [print_(0.03, 500, T0 + 900)], T0 + 1000)
     assert o.filled_shares == 0.0
     assert o.expired(T0 + 1000)
 
@@ -149,7 +149,7 @@ def test_malformed_prints_do_not_crash_the_fill():
     tape = [{"price": "oops", "size": "5", "timestamp": T0 + 1},
             {"size": "5", "timestamp": T0 + 1},
             print_(0.03, 25, T0 + 2)]
-    limits.apply_tape(o, tape, NO_FEE, T0 + 10)
+    limits.apply_tape(o, tape, T0 + 10)
     assert o.filled_shares == pytest.approx(25)
 
 
@@ -158,7 +158,7 @@ def test_malformed_prints_do_not_crash_the_fill():
 def test_maker_fill_pays_no_fee():
     """Every live schedule sampled carries takerOnly: true."""
     o = order(book(bids=[]), his_price=0.03)
-    limits.apply_tape(o, [print_(0.03, 200, T0 + 5)], WEATHER, T0 + 10)
+    limits.apply_tape(o, [print_(0.03, 200, T0 + 5)], T0 + 10)
     assert o.filled_shares > 0
     assert o.fee_usd == 0.0
     assert o.filled_usd == pytest.approx(o.filled_shares * 0.03)
@@ -170,7 +170,7 @@ def test_resting_beats_crossing_on_the_same_pick():
     b = book(bids=[(0.029, 500)], asks=[(0.089, 10_000)])
     crossed = simulate_buy(b, 3.00, WEATHER, max_fill_price=0.50)
     o = limits.place(b, 0.03, 3.00, now=T0, ttl_seconds=300)
-    limits.apply_tape(o, [print_(0.03, 200, T0 + 30)], WEATHER, T0 + 60)
+    limits.apply_tape(o, [print_(0.03, 200, T0 + 30)], T0 + 60)
     assert crossed.filled and crossed.avg_price == pytest.approx(0.089)
     assert o.filled_shares > 0
     assert o.limit_price == pytest.approx(0.03)
@@ -194,7 +194,7 @@ def test_buyer_lifting_an_ask_does_not_fill_our_bid():
     Counting it would inflate the fill rate -- the one number that decides
     whether this strategy is reachable."""
     o = order(book(bids=[]), his_price=0.03)
-    limits.apply_tape(o, [print_(0.03, 500, T0 + 10, side="BUY")], NO_FEE, T0 + 20)
+    limits.apply_tape(o, [print_(0.03, 500, T0 + 10, side="BUY")], T0 + 20)
     assert o.filled_shares == 0.0
 
 
@@ -203,20 +203,20 @@ def test_his_own_print_never_fills_us():
     against the person we are copying."""
     o = order(book(bids=[]), his_price=0.03)
     tape = [print_(0.03, 500, T0 + 10, side="SELL", wallet="0xHIM")]
-    limits.apply_tape(o, tape, NO_FEE, T0 + 20, exclude_wallet="0xhim")
+    limits.apply_tape(o, tape, T0 + 20, exclude_wallet="0xhim")
     assert o.filled_shares == 0.0
 
 
 def test_a_stranger_selling_does_fill_us():
     o = order(book(bids=[]), his_price=0.03)
     tape = [print_(0.03, 40, T0 + 10, side="SELL", wallet="0xsomeone")]
-    limits.apply_tape(o, tape, NO_FEE, T0 + 20, exclude_wallet="0xhim")
+    limits.apply_tape(o, tape, T0 + 20, exclude_wallet="0xhim")
     assert o.filled_shares == pytest.approx(40)
 
 
 def test_relaxing_the_sell_requirement_counts_both():
     o = order(book(bids=[]), his_price=0.03)
-    limits.apply_tape(o, [print_(0.03, 40, T0 + 10, side="BUY")], NO_FEE, T0 + 20,
+    limits.apply_tape(o, [print_(0.03, 40, T0 + 10, side="BUY")], T0 + 20,
                       require_sell_prints=False)
     assert o.filled_shares == pytest.approx(40)
 
@@ -229,7 +229,7 @@ def test_both_conventions_are_measured_every_time():
     o = order(book(bids=[]), his_price=0.03)
     tape = [print_(0.03, 40, T0 + 5, side="SELL"),
             print_(0.03, 90, T0 + 6, side="BUY")]
-    limits.apply_tape(o, tape, NO_FEE, T0 + 10)
+    limits.apply_tape(o, tape, T0 + 10)
     assert o.filled_shares == pytest.approx(40)       # SELL drives the position
     assert o.alt_filled_shares == pytest.approx(90)   # BUY measured alongside
     assert o.prints_observed == 1 and o.alt_prints_observed == 1
@@ -237,7 +237,7 @@ def test_both_conventions_are_measured_every_time():
 
 def test_alternate_convention_never_touches_the_position():
     o = order(book(bids=[]), his_price=0.03)
-    limits.apply_tape(o, [print_(0.03, 500, T0 + 5, side="BUY")], NO_FEE, T0 + 10)
+    limits.apply_tape(o, [print_(0.03, 500, T0 + 5, side="BUY")], T0 + 10)
     assert o.filled_shares == 0.0
     assert o.filled_usd == 0.0
     assert o.alt_filled_shares == pytest.approx(100)  # capped at target
@@ -246,7 +246,7 @@ def test_alternate_convention_never_touches_the_position():
 
 def test_conventions_agree_when_all_prints_share_a_label():
     o = order(book(bids=[]), his_price=0.03)
-    limits.apply_tape(o, [print_(0.03, 30, T0 + 5, side="SELL")], NO_FEE, T0 + 10)
+    limits.apply_tape(o, [print_(0.03, 30, T0 + 5, side="SELL")], T0 + 10)
     assert o.filled_shares == pytest.approx(30)
     assert o.alt_filled_shares == 0.0
 
@@ -255,6 +255,6 @@ def test_his_own_print_excluded_from_both_conventions():
     o = order(book(bids=[]), his_price=0.03)
     tape = [print_(0.03, 500, T0 + 5, side="SELL", wallet="0xHIM"),
             print_(0.03, 500, T0 + 6, side="BUY", wallet="0xHIM")]
-    limits.apply_tape(o, tape, NO_FEE, T0 + 10, exclude_wallet="0xhim")
+    limits.apply_tape(o, tape, T0 + 10, exclude_wallet="0xhim")
     assert o.filled_shares == 0.0
     assert o.alt_filled_shares == 0.0

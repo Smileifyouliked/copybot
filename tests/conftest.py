@@ -124,7 +124,7 @@ class FakeExecutor:
     def poll_limit(self, order, now):
         from copybot import limits
         self.polls.append(order.condition_id)
-        return limits.apply_tape(order, self.tape, self.fee, now,
+        return limits.apply_tape(order, self.tape, now,
                                  require_sell_prints=True,
                                  exclude_wallet=self.exclude_wallet)
 
@@ -140,10 +140,30 @@ class FakeExecutor:
                            decision_ts=decision_ts, max_book_lag_seconds=3600)
 
 
+def open_meta(condition_id="0xcond1"):
+    """A market that exists, is open, and quotes no outcome price.
+
+    The entry gate refuses to copy a market it cannot confirm is trading, so a
+    client that knows nothing declines every trade. Live gamma does know about
+    a market he just traded in, so an unconfigured condition_id resolves to
+    this rather than to nothing. Empty `token_ids` keeps it out of the marking
+    path: `price_for_token` returns None, exactly as an absent meta did, so
+    tests about marks and settlement still exercise their own fallbacks.
+    """
+    return MarketMeta(
+        condition_id=condition_id, question="", token_ids=(), outcomes=(),
+        outcome_prices=(), closed=False, accepting_orders=True,
+        fee_rate=None, fee_type=None, fees_enabled=False, end_date=None,
+    )
+
+
 class FakeClient:
-    def __init__(self, books=None, metas=None):
+    def __init__(self, books=None, metas=None, known_only=False):
         self.books = books or {}
         self.metas = metas or {}
+        # known_only: gamma has never heard of these markets. For tests about
+        # what happens when metadata cannot be had.
+        self.known_only = known_only
 
     def get_book(self, token_id):
         return self.books.get(token_id) or make_book(token_id=token_id)
@@ -152,7 +172,13 @@ class FakeClient:
         return {t: self.books.get(t) or make_book(token_id=t) for t in token_ids}
 
     def get_markets(self, condition_ids, force=False):
-        return {c: self.metas[c] for c in condition_ids if c in self.metas}
+        out = {}
+        for c in condition_ids:
+            if c in self.metas:
+                out[c] = self.metas[c]
+            elif not self.known_only:
+                out[c] = open_meta(c)
+        return out
 
     def fee_rate_for(self, condition_id, fallback):
         meta = self.metas.get(condition_id)
